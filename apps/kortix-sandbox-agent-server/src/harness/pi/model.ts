@@ -1,0 +1,216 @@
+/**
+ * Model resolution for the pi harness.
+ *
+ * Every model a session can run is served by the Kortix LLM gateway under
+ * the synthetic `kortix` provider — the same provider OpenCode's config
+ * registers. pi talks to it through its OpenAI-completions API, pointed at the
+ * daemon's localhost LLM proxy when one runs (credential injection, image
+ * window) and at the gateway directly otherwise.
+ *
+ * The picker's catalog comes from the image-baked file the OpenCode path also
+ * reads; the selected model comes from `KORTIX_MODEL` (the control
+ * plane's resolved session model — the variable is named for the first
+ * harness, the value is harness-neutral), then the compiled agent config.
+ */
+import { readFileSync } from 'node:fs'
+import type { Api, Model } from '@earendil-works/pi-ai'
+import {
+  InMemoryCredentialStore,
+  createModels,
+  createProvider,
+  envApiKeyAuth,
+  type MutableModels,
+} from '@earendil-works/pi-ai'
+import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
+import { DEFAULT_COMPACTION_SETTINGS } from '@earendil-works/pi-coding-agent'
+import { LLM_PROXY_PLACEHOLDER_KEY } from '@/services/llm-proxy/llm-proxy'
+import { logger } from '@/lib/log/logger'
+import type { KortixGatewayModel } from '@kortix/api-contract/fallback-models'
+import { variantsFromReasoningOptions } from '../shared/reasoning-variants'
+
+/** Staged unconditionally by apps/api's snapshot build-context. A host that
+ *  really bakes one (every Kortix sandbox image) can hide it from the test
+ *  suite through KORTIX_BAKED_LLM_CATALOG_PATH. */
+export const BAKED_LLM_CATALOG_PATH =
+  process.env.KORTIX_BAKED_LLM_CATALOG_PATH || '/opt/kortix/llm-catalog.json'
+export const KORTIX_PROVIDER_ID = 'kortix'
+const PI_THINKING_LEVELS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+
+export interface CatalogModel {
+  name?: string
+  reasoning?: boolean
+  /** False when the model refuses a non-default temperature. */
+  temperature?: boolean
+  attachment?: boolean
+  limit?: { context?: number; input?: number; output?: number }
+  variants?: Record<string, unknown>
+  reasoning_options?: KortixGatewayModel['reasoning_options']
+}
+
+export function readCatalogFile(path: string = process.env.KORTIX_LLM_CATALOG_FILE || BAKED_LLM_CATALOG_PATH): Record<string, CatalogModel> {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { models?: Record<string, CatalogModel> } | Record<string, CatalogModel>
+    const models = (parsed && typeof parsed === 'object' && 'models' in parsed ? (parsed as { models?: Record<string, CatalogModel> }).models : (parsed as Record<string, CatalogModel>)) ?? {}
+    return models
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * The project's servable models with their real limits: `GET /models?scope=picker`,
+ * the list the web picker shows. It carries what the image-baked catalog cannot:
+ * custom endpoints, Platinum BYOK and models newer than the image. Empty on failure.
+ */
+export async function fetchPickerCatalog(env: NodeJS.ProcessEnv): Promise<Record<string, CatalogModel>> {
+  const base = env.KORTIX_LLM_BASE_URL?.trim()
+  const token = env.KORTIX_TOKEN?.trim()
+  if (!base || !token) return {}
+  try {
+    const res = await fetch(`${base.replace(/\/+$/, '')}/models?scope=picker`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(3_000),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return ((await res.json()) as { models?: Record<string, CatalogModel> }).models ?? {}
+  } catch (err) {
+    logger.warn('[pi] live model catalog unavailable; the baked catalog sizes the models', { err: String(err) })
+    return {}
+  }
+}
+
+/**
+ * pi compacts at `contextWindow - reserveTokens`. Its default reserve (16,384) assumes the answer
+ * never needs more than that. A model whose real output limit is larger runs out of room while pi
+ * still sees headroom, so the provider cuts the answer (`stopReason: length`) — the session then
+ * shows `output_length` at a context the meter calls nearly full. Reserve the model's own output
+ * limit instead, floored at pi's default and at the reserve a project configures, and capped at
+ * half the window, so a model that claims most of its window as output still compacts.
+ */
+export function compactionSettings(catalog: Record<string, CatalogModel>, configuredReserve = 0) {
+  const modelOverrides: Record<string, { reserveTokens: number }> = {}
+  const floor = Math.max(Math.floor(configuredReserve), DEFAULT_COMPACTION_SETTINGS.reserveTokens)
+  for (const [id, entry] of Object.entries(catalog)) {
+    // The window and output pi will use (gatewayModel's fallbacks), so the reserve matches the request's cap.
+    const window = entry?.limit?.context ?? 128_000
+    const output = entry?.limit?.output ?? entry?.limit?.context ?? 32_768
+    const reserveTokens = Math.min(Math.max(Math.floor(output), floor), Math.floor(window / 2))
+    if (reserveTokens > DEFAULT_COMPACTION_SETTINGS.reserveTokens) modelOverrides[`${KORTIX_PROVIDER_ID}/${id}`] = { reserveTokens }
+  }
+  return { modelOverrides }
+}
+
+/** `kortix/<id>` and bare `<id>` both name the gateway model `<id>`. */
+export function nativeModelId(ref: string | undefined | null): string | null {
+  const raw = (ref ?? '').trim()
+  if (!raw) return null
+  const id = raw.startsWith(`${KORTIX_PROVIDER_ID}/`) ? raw.slice(KORTIX_PROVIDER_ID.length + 1) : raw
+  return id || null
+}
+
+/** OpenCode `variant` names that pi can honour as a thinking level. */
+export function reasoningVariants(entry: CatalogModel | undefined): string[] {
+  if (!entry?.reasoning) return []
+  const names = [...Object.keys(entry.variants ?? {}), ...Object.keys(variantsFromReasoningOptions(entry) ?? {})]
+  return [...new Set(names.filter((name) => PI_THINKING_LEVELS.has(name)))]
+}
+
+export interface GatewayTarget {
+  baseUrl: string
+  apiKey: string
+}
+
+/** Where pi sends model requests: the localhost proxy when it runs, else the gateway. */
+export function resolveGatewayTarget(env: NodeJS.ProcessEnv = process.env): GatewayTarget | null {
+  const proxy = env.KORTIX_LLM_PROXY_URL?.trim()
+  if (proxy && env.KORTIX_LLM_PROXY_DISABLE !== '1') return { baseUrl: proxy.replace(/\/+$/, ''), apiKey: LLM_PROXY_PLACEHOLDER_KEY }
+  const base = env.KORTIX_LLM_BASE_URL?.trim()
+  const token = env.KORTIX_TOKEN?.trim()
+  if (!base || !token) return null
+  return { baseUrl: base.replace(/\/+$/, ''), apiKey: token }
+}
+
+export interface SelectedModel {
+  model: Model<Api>
+  providerID: string
+  modelID: string
+  variants: string[]
+  images: boolean
+  contextWindow: number
+}
+
+export interface PiModels {
+  models: MutableModels
+  /** Resolve a gateway model id (already stripped of `kortix/`), or the default. */
+  select(modelId: string | null): SelectedModel
+  /** The catalog the picker lists. */
+  catalog: Record<string, CatalogModel>
+}
+
+function gatewayModel(id: string, entry: CatalogModel | undefined, target: GatewayTarget): Model<'openai-completions'> {
+  return {
+    id,
+    name: entry?.name ?? id,
+    api: 'openai-completions',
+    provider: KORTIX_PROVIDER_ID,
+    baseUrl: target.baseUrl,
+    reasoning: entry?.reasoning === true,
+    input: entry?.attachment ? ['text', 'image'] : ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    // No source knows the window: pi's own default for a model it cannot size.
+    contextWindow: entry?.limit?.context ?? 128_000,
+    // pi clamps a request's max_tokens to the room left in the window.
+    maxTokens: entry?.limit?.output ?? entry?.limit?.context ?? 32_768,
+    compat: { thinkingFormat: 'openai', supportsStore: false, supportsDeveloperRole: false },
+    // pi-ai clamps `xhigh` and `max` down to `high` unless the model maps them.
+    thinkingLevelMap: Object.fromEntries(
+      reasoningVariants(entry).filter((level) => level === 'xhigh' || level === 'max').map((level) => [level, level]),
+    ),
+  }
+}
+
+export async function createPiModels(input: {
+  env?: NodeJS.ProcessEnv
+  defaultModelRef?: string | null
+}): Promise<PiModels> {
+  const env = input.env ?? process.env
+  const credentials = new InMemoryCredentialStore()
+  const models = createModels({ credentials })
+
+  const target = resolveGatewayTarget(env)
+  if (!target) throw new Error('pi harness needs KORTIX_LLM_BASE_URL and KORTIX_TOKEN (the Kortix LLM gateway)')
+  const catalog = { ...readCatalogFile(env.KORTIX_LLM_CATALOG_FILE), ...(await fetchPickerCatalog(env)) }
+  const provider = createProvider({
+    id: KORTIX_PROVIDER_ID,
+    name: 'Kortix',
+    baseUrl: target.baseUrl,
+    auth: { apiKey: envApiKeyAuth('Kortix gateway token', ['KORTIX_PI_GATEWAY_KEY']) },
+    models: Object.entries(catalog).map(([id, entry]) => gatewayModel(id, entry, target)),
+    api: { 'openai-completions': openAICompletionsApi() },
+  })
+  models.setProvider(provider)
+  await credentials.modify(KORTIX_PROVIDER_ID, async () => ({ type: 'api_key', key: target.apiKey }))
+  const fallback = nativeModelId(input.defaultModelRef) ?? Object.keys(catalog)[0] ?? null
+  if (!fallback) throw new Error('pi harness has no model: no KORTIX_MODEL and no baked catalog')
+  logger.info('[pi] gateway models ready', { baseUrl: target.baseUrl, catalog: Object.keys(catalog).length, fallback })
+
+  return {
+    models,
+    catalog,
+    select(modelId) {
+      const id = modelId ?? fallback
+      const entry = catalog[id]
+      // A model the picker offers but the baked catalog lacks still routes:
+      // the gateway resolves ids server-side, the catalog only sizes the window.
+      const model = models.getModel(KORTIX_PROVIDER_ID, id) ?? gatewayModel(id, entry, target)
+      return {
+        model,
+        providerID: KORTIX_PROVIDER_ID,
+        modelID: id,
+        variants: reasoningVariants(entry),
+        images: model.input.includes('image'),
+        contextWindow: model.contextWindow,
+      }
+    },
+  }
+}

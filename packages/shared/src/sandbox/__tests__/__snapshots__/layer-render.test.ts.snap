@@ -1,0 +1,426 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`rendered layer (golden) shared platform default 1`] = `
+"# syntax=docker/dockerfile:1.7
+# Kortix platform default sandbox base.
+# Sessions clone the project workspace at boot — nothing project-specific
+# is baked in here. Customize via \`sandbox.templates\` in kortix.yaml.
+FROM ubuntu:24.04
+
+WORKDIR /workspace
+
+# ─── Kortix runtime layer (auto-injected) ──────────────────────────
+# Everything below is added by the Kortix snapshot builder. Do not
+# edit by hand — your project Dockerfile above is preserved verbatim.
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends \\
+        ca-certificates curl git gzip libatomic1 sudo tmux iproute2 iputils-arping util-linux \\
+        build-essential ffmpeg fonts-dejavu fonts-liberation fonts-noto fonts-noto-cjk \\
+        latexmk libreoffice pandoc pkg-config poppler-utils qpdf tesseract-ocr \\
+        texlive-bibtex-extra texlive-fonts-recommended texlive-latex-base \\
+        texlive-latex-extra texlive-latex-recommended \\
+        bat bc fd-find file fzf git-lfs htop iputils-ping jq less lsof moreutils nano netcat-openbsd openssh-client patch procps ripgrep rsync sqlite3 tree unzip wget xz-utils zip zstd \\
+    && rm -rf /var/lib/apt/lists/* \\
+    && (command -v fd >/dev/null || ln -s "$(command -v fdfind)" /usr/local/bin/fd) && (command -v bat >/dev/null || ln -s "$(command -v batcat)" /usr/local/bin/bat) && rg --version >/dev/null && fd --version >/dev/null && bat --version >/dev/null && jq --version >/dev/null && fzf --version >/dev/null
+
+RUN useradd --create-home --shell /bin/bash --user-group kortix \\
+    && echo 'kortix ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kortix \\
+    && chmod 0440 /etc/sudoers.d/kortix \\
+    && mkdir -p /workspace /opt/kortix /opt/pw-browsers /ephemeral/kortix-master/opencode \\
+        /home/kortix/.local/bin /home/kortix/.local/share/pnpm/bin /home/kortix/.bun/bin \\
+    && chown -R kortix:kortix /workspace /opt/kortix /opt/pw-browsers /ephemeral /home/kortix
+ENV PNPM_HOME=/home/kortix/.local/share/pnpm \\
+    PATH=/home/kortix/.local/bin:/home/kortix/.local/share/pnpm/bin:/home/kortix/.bun/bin:$PATH
+USER kortix
+
+RUN case "$(uname -m)" in \\
+      x86_64) uv_arch=x86_64; uv_sha=04bc7d180d6138bf6dc08387acf507a823f397a98fea55da36b0ccc7fbce3b68 ;; \\
+      aarch64|arm64) uv_arch=aarch64; uv_sha=8c11d90f5f66d232930cf8ae3a085c39877690d409e10878234802b028b20e2a ;; \\
+      *) echo "unsupported uv architecture: $(uname -m)" >&2; exit 1 ;; \\
+    esac \\
+    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/uv.tar.gz \\
+         "https://github.com/astral-sh/uv/releases/download/0.11.30/uv-\${uv_arch}-unknown-linux-gnu.tar.gz" \\
+    && echo "\${uv_sha}  /tmp/uv.tar.gz" | sha256sum -c - \\
+    && tar -xzf /tmp/uv.tar.gz --strip-components=1 -C /home/kortix/.local/bin \\
+    && rm /tmp/uv.tar.gz \\
+    && uv --version | grep -Eq '^uv 0.11.30( |$)' \\
+    && UV_PYTHON_DOWNLOADS=automatic uv python install --default 3.12.13 \\
+    && python -c 'import sys; assert sys.version_info[:3] == (3, 12, 13); print("managed python:", sys.version)' \\
+    && python3 -c 'import sys; assert sys.version_info[:3] == (3, 12, 13)'
+
+RUN uv pip install --python /home/kortix/.local/bin/python3 --break-system-packages \\
+        "lxml==6.1.1" \\
+        "markitdown[pptx]==0.1.7" \\
+        "openpyxl==3.1.5" \\
+        "pandas==3.0.5" \\
+        "pdf2docx==0.5.13" \\
+        "pdf2image==1.17.0" \\
+        "pdfplumber==0.11.10" \\
+        "pillow==12.3.0" \\
+        "playwright==1.60.0" \\
+        "pymupdf==1.28.0" \\
+        "pypdf==6.14.2" \\
+        "pypdfium2==5.12.1" \\
+        "pytesseract==0.3.13" \\
+        "python-docx==1.2.0" \\
+        "python-pptx==1.0.2" \\
+        "reportlab==5.0.0" \\
+    && python3 -c 'import importlib; [importlib.import_module(m) for m in ["PIL","docx","fitz","lxml","markitdown","openpyxl","pandas","pdf2docx","pdf2image","pdfplumber","playwright","pptx","pypdf","pypdfium2","pytesseract","reportlab"]]; print("python package floor OK")'
+
+ENV SHELL=/bin/bash
+RUN case "$(uname -m)" in \\
+      x86_64) pnpm_arch=x64; pnpm_sha=0c1373b6390f6b89ff8b896d3647c9826577ddc49173a2f732da69b36569f9e0 ;; \\
+      aarch64|arm64) pnpm_arch=arm64; pnpm_sha=361e385867146972d0635a41a1871cb44c9c23f65acce78a5f1ca1d44ac0afcd ;; \\
+      *) echo "unsupported pnpm architecture: $(uname -m)" >&2; exit 1 ;; \\
+    esac \\
+    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/pnpm.tar.gz \\
+         "https://github.com/pnpm/pnpm/releases/download/v11.15.1/pnpm-linux-\${pnpm_arch}.tar.gz" \\
+    && echo "\${pnpm_sha}  /tmp/pnpm.tar.gz" | sha256sum -c - \\
+    && tar -xzf /tmp/pnpm.tar.gz -C /home/kortix/.local/bin \\
+    && rm /tmp/pnpm.tar.gz \\
+    && test "$(pnpm --version)" = "11.15.1" \\
+    && pnpm runtime set node 22.23.1 -g \\
+    && test "$(node --version)" = "v22.23.1" \\
+    && pnpm add -g "npm@12.0.1" \\
+    && test "$(npm --version)" = "12.0.1"
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \\
+    AGENT_BROWSER_EXECUTABLE_PATH=/home/kortix/.local/bin/chromium \\
+    AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage \\
+    PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=1800000
+RUN pnpm add -g --allow-build=agent-browser "agent-browser@0.27.0" \\
+    && agent-browser --version \\
+    && for pw_try in 1 2 3 4 5; do \\
+        pnpm dlx playwright@1.60.0 install --with-deps chromium && break; \\
+        echo "playwright chromium install attempt $pw_try failed, retrying..."; \\
+        sleep $((pw_try*10)); \\
+    done \\
+    && sudo rm -rf /var/lib/apt/lists/* \\
+    && pw_chrome="$(find /opt/pw-browsers -type f -path '*chrome-linux*/chrome' | head -n1)" \\
+    && test -n "$pw_chrome" \\
+    && ln -sf "$pw_chrome" /home/kortix/.local/bin/chromium \\
+    && mkdir -p /home/kortix/.agent-browser/browsers \\
+    && ln -sf "$(dirname "$pw_chrome")" /home/kortix/.agent-browser/browsers/chrome-linux64 \\
+    && chromium --version \\
+    && env -u AGENT_BROWSER_EXECUTABLE_PATH agent-browser doctor 2>&1 | grep -qE 'pass.+chrome-linux64/chrome'
+
+RUN pnpm add -g --allow-build=opencode-ai "opencode-ai@1.18.23" \\
+    && command -v opencode \\
+    && opencode --version \\
+    && opencode_native="$(sed -n 's/^# cmd-shim-target=//p' "$(command -v opencode)" | tail -n 1)" \\
+    && test -x "$opencode_native" \\
+    && test "$(wc -c < "$opencode_native")" -gt 50000000 \\
+    && test "$("$opencode_native" --version)" = "1.18.23" \\
+    && ln -sfn "$opencode_native" /opt/kortix/opencode.current \\
+    && sudo ln -sfn /opt/kortix/opencode.current /usr/local/bin/opencode-kortix \\
+    && test "$(/usr/local/bin/opencode-kortix --version)" = "1.18.23"
+
+COPY --chown=kortix:kortix kortix-opencode-warmup /tmp/kortix-opencode-warmup
+RUN bash /tmp/kortix-opencode-warmup migration && rm -f /tmp/kortix-opencode-warmup
+
+RUN case "$(uname -m)" in \\
+      x86_64) bun_arch=x64; bun_sha=3e730528d89775f03f87f05c06787c4df4099d0a37f3f252e7b829cb23816e18 ;; \\
+      aarch64|arm64) bun_arch=aarch64; bun_sha=efa9813da5ed72423bf847f916e8d2c47c0d776add972354026a75e10da9aa21 ;; \\
+      *) echo "unsupported Bun architecture: $(uname -m)" >&2; exit 1 ;; \\
+    esac \\
+    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/bun.zip \\
+         "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-linux-\${bun_arch}.zip" \\
+    && echo "\${bun_sha}  /tmp/bun.zip" | sha256sum -c - \\
+    && unzip -q /tmp/bun.zip -d /tmp/bun \\
+    && install -m 0755 "/tmp/bun/bun-linux-\${bun_arch}/bun" /home/kortix/.bun/bin/bun \\
+    && ln -sf bun /home/kortix/.bun/bin/bunx \\
+    && rm -rf /tmp/bun /tmp/bun.zip \\
+    && test "$(bun --version)" = "1.4.3"
+
+RUN pnpm add -g "@firecrawl/anydoc@0.1.6" \\
+    && command -v anydoc \\
+    && test "$(anydoc --version)" = "0.1.6"
+
+RUN mkdir -p /opt/kortix/opencode-config-deps \\
+    && cd /opt/kortix/opencode-config-deps \\
+    && printf '{"name":"kortix-opencode-config","private":true,"dependencies":{"@mendable/firecrawl-js":"^4.25.1","@opencode-ai/plugin":"1.18.23","@tavily/core":"^0.7.3","bun-pty":"0.4.11","replicate":"^1.4.0","zod":"4.1.8"},"overrides":{"axios":"1.18.0","form-data":"4.0.6"}}' > package.json \\
+    && bun install
+
+RUN cd /opt/kortix/opencode-config-deps \\
+    && bun build node_modules/axios/lib/utils.js node_modules/form-data/lib/form_data.js --target=bun --outdir=/tmp/opencode-deps-bundle-check \\
+    && rm -rf /tmp/opencode-deps-bundle-check \\
+    && echo "opencode-config-deps: baked tree bundles cleanly"
+
+COPY --chown=kortix:kortix kortix-opencode-config/ /opt/kortix/warm-config/.kortix/opencode/
+RUN sudo chown -R kortix:kortix /opt/kortix/warm-config
+RUN cd /opt/kortix/warm-config/.kortix/opencode \\
+    && rm -rf node_modules \\
+    && ln -s /opt/kortix/opencode-config-deps/node_modules node_modules \\
+    && bun build plugins/*.ts --target=bun --outdir=/tmp/opencode-plugins-bundle-check \\
+    && rm -rf /tmp/opencode-plugins-bundle-check \\
+    && echo "opencode-config-deps: starter plugin files bundle cleanly"
+
+COPY --chown=kortix:kortix kortix-opencode-warmup /tmp/kortix-opencode-warmup
+RUN bash /tmp/kortix-opencode-warmup instance wipe && rm -f /tmp/kortix-opencode-warmup
+
+USER root
+COPY kortix-agent.gz /tmp/kortix-agent.gz
+COPY kortix.gz /tmp/kortix.gz
+COPY kortix-entrypoint /usr/local/bin/kortix-entrypoint
+COPY MACHINE.md /MACHINE.md
+COPY kortix-slack-cli/ /opt/kortix/apps/sandbox/slack-cli/
+COPY kortix-llm-catalog.json /opt/kortix/llm-catalog.json
+COPY scaffold.git /opt/kortix/scaffold.git
+RUN gunzip -c /tmp/kortix-agent.gz > /usr/local/bin/kortix-agent \\
+    && gunzip -c /tmp/kortix.gz > /usr/local/bin/kortix \\
+    && rm /tmp/kortix-agent.gz /tmp/kortix.gz \\
+    && bash -n /usr/local/bin/kortix-entrypoint \\
+    && chmod +x /usr/local/bin/kortix-agent /usr/local/bin/kortix /usr/local/bin/kortix-entrypoint \\
+        /opt/kortix/apps/sandbox/slack-cli/install-shims.sh \\
+    && bash /opt/kortix/apps/sandbox/slack-cli/install-shims.sh /opt/kortix/apps/sandbox/slack-cli \\
+    && kortix --version \\
+    && chown kortix:kortix /usr/local/bin \\
+    && mkdir -p /home/kortix/.config/opencode && chown kortix:kortix /home/kortix/.config /home/kortix/.config/opencode && echo '{"autoupdate":false}' > /home/kortix/.config/opencode/opencode.json && chown kortix:kortix /home/kortix/.config/opencode/opencode.json && chmod 0644 /home/kortix/.config/opencode/opencode.json \\
+    && chown -R kortix:kortix /opt/kortix /workspace /ephemeral
+
+COPY --chown=kortix:kortix managed-skills /opt/kortix/managed-skills
+RUN kortix-agent bake-runtime-assets-state \\
+    && chown kortix:kortix /opt/kortix/runtime-assets-state.json
+
+RUN { \\
+      echo '# Kortix sandbox shell hook. Written by the Kortix runtime layer. Do not edit.'; \\
+      echo '# Debian resets PATH in /etc/profile for login shells: restore the Kortix tool dirs.'; \\
+      echo 'kortix_path_prefix='; \\
+      echo 'for kortix_path_dir in /home/kortix/.local/bin /home/kortix/.local/share/pnpm/bin /home/kortix/.bun/bin; do'; \\
+      echo '  case ":\${PATH-}:" in'; \\
+      echo '    *":\${kortix_path_dir}:"*) ;;'; \\
+      echo '    *) kortix_path_prefix="\${kortix_path_prefix}\${kortix_path_dir}:" ;;'; \\
+      echo '  esac'; \\
+      echo 'done'; \\
+      echo 'if [ -n "\${PATH-}" ]; then PATH="\${kortix_path_prefix}\${PATH}"; else PATH="\${kortix_path_prefix%:}"; fi'; \\
+      echo 'export PATH'; \\
+      echo 'unset kortix_path_prefix kortix_path_dir'; \\
+      echo '# Live project secrets, written by the kortix-agent daemon on tmpfs.'; \\
+      echo 'if [ -r /dev/shm/kortix/agent-env.sh ]; then . /dev/shm/kortix/agent-env.sh; fi'; \\
+    } > /etc/profile.d/zz-kortix.sh \\
+    && chmod 0644 /etc/profile.d/zz-kortix.sh \\
+    && { grep -qxF 'if [ -r /etc/profile.d/zz-kortix.sh ]; then . /etc/profile.d/zz-kortix.sh; fi' /etc/bash.bashrc 2>/dev/null \\
+         || echo 'if [ -r /etc/profile.d/zz-kortix.sh ]; then . /etc/profile.d/zz-kortix.sh; fi' >> /etc/bash.bashrc; }
+
+ENV KORTIX_WORKSPACE=/workspace
+USER kortix
+WORKDIR /workspace
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/kortix-entrypoint"]
+"
+`;
+
+exports[`rendered layer (golden) custom template (user seeds /workspace) 1`] = `
+"FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends gdal-bin
+
+WORKDIR /workspace
+RUN mkdir -p /workspace/data && echo seed > /workspace/data/basemap.tif
+
+# ─── Kortix runtime layer (auto-injected) ──────────────────────────
+# Everything below is added by the Kortix snapshot builder. Do not
+# edit by hand — your project Dockerfile above is preserved verbatim.
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends \\
+        ca-certificates curl git gzip libatomic1 sudo tmux iproute2 iputils-arping util-linux \\
+        build-essential ffmpeg fonts-dejavu fonts-liberation fonts-noto fonts-noto-cjk \\
+        latexmk libreoffice pandoc pkg-config poppler-utils qpdf tesseract-ocr \\
+        texlive-bibtex-extra texlive-fonts-recommended texlive-latex-base \\
+        texlive-latex-extra texlive-latex-recommended \\
+        bat bc fd-find file fzf git-lfs htop iputils-ping jq less lsof moreutils nano netcat-openbsd openssh-client patch procps ripgrep rsync sqlite3 tree unzip wget xz-utils zip zstd \\
+    && rm -rf /var/lib/apt/lists/* \\
+    && (command -v fd >/dev/null || ln -s "$(command -v fdfind)" /usr/local/bin/fd) && (command -v bat >/dev/null || ln -s "$(command -v batcat)" /usr/local/bin/bat) && rg --version >/dev/null && fd --version >/dev/null && bat --version >/dev/null && jq --version >/dev/null && fzf --version >/dev/null
+
+RUN useradd --create-home --shell /bin/bash --user-group kortix \\
+    && echo 'kortix ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kortix \\
+    && chmod 0440 /etc/sudoers.d/kortix \\
+    && mkdir -p /workspace /opt/kortix /opt/pw-browsers /ephemeral/kortix-master/opencode \\
+        /home/kortix/.local/bin /home/kortix/.local/share/pnpm/bin /home/kortix/.bun/bin \\
+    && chown -R kortix:kortix /workspace /opt/kortix /opt/pw-browsers /ephemeral /home/kortix
+ENV PNPM_HOME=/home/kortix/.local/share/pnpm \\
+    PATH=/home/kortix/.local/bin:/home/kortix/.local/share/pnpm/bin:/home/kortix/.bun/bin:$PATH
+USER kortix
+
+RUN case "$(uname -m)" in \\
+      x86_64) uv_arch=x86_64; uv_sha=04bc7d180d6138bf6dc08387acf507a823f397a98fea55da36b0ccc7fbce3b68 ;; \\
+      aarch64|arm64) uv_arch=aarch64; uv_sha=8c11d90f5f66d232930cf8ae3a085c39877690d409e10878234802b028b20e2a ;; \\
+      *) echo "unsupported uv architecture: $(uname -m)" >&2; exit 1 ;; \\
+    esac \\
+    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/uv.tar.gz \\
+         "https://github.com/astral-sh/uv/releases/download/0.11.30/uv-\${uv_arch}-unknown-linux-gnu.tar.gz" \\
+    && echo "\${uv_sha}  /tmp/uv.tar.gz" | sha256sum -c - \\
+    && tar -xzf /tmp/uv.tar.gz --strip-components=1 -C /home/kortix/.local/bin \\
+    && rm /tmp/uv.tar.gz \\
+    && uv --version | grep -Eq '^uv 0.11.30( |$)' \\
+    && UV_PYTHON_DOWNLOADS=automatic uv python install --default 3.12.13 \\
+    && python -c 'import sys; assert sys.version_info[:3] == (3, 12, 13); print("managed python:", sys.version)' \\
+    && python3 -c 'import sys; assert sys.version_info[:3] == (3, 12, 13)'
+
+RUN uv pip install --python /home/kortix/.local/bin/python3 --break-system-packages \\
+        "lxml==6.1.1" \\
+        "markitdown[pptx]==0.1.7" \\
+        "openpyxl==3.1.5" \\
+        "pandas==3.0.5" \\
+        "pdf2docx==0.5.13" \\
+        "pdf2image==1.17.0" \\
+        "pdfplumber==0.11.10" \\
+        "pillow==12.3.0" \\
+        "playwright==1.60.0" \\
+        "pymupdf==1.28.0" \\
+        "pypdf==6.14.2" \\
+        "pypdfium2==5.12.1" \\
+        "pytesseract==0.3.13" \\
+        "python-docx==1.2.0" \\
+        "python-pptx==1.0.2" \\
+        "reportlab==5.0.0" \\
+    && python3 -c 'import importlib; [importlib.import_module(m) for m in ["PIL","docx","fitz","lxml","markitdown","openpyxl","pandas","pdf2docx","pdf2image","pdfplumber","playwright","pptx","pypdf","pypdfium2","pytesseract","reportlab"]]; print("python package floor OK")'
+
+ENV SHELL=/bin/bash
+RUN case "$(uname -m)" in \\
+      x86_64) pnpm_arch=x64; pnpm_sha=0c1373b6390f6b89ff8b896d3647c9826577ddc49173a2f732da69b36569f9e0 ;; \\
+      aarch64|arm64) pnpm_arch=arm64; pnpm_sha=361e385867146972d0635a41a1871cb44c9c23f65acce78a5f1ca1d44ac0afcd ;; \\
+      *) echo "unsupported pnpm architecture: $(uname -m)" >&2; exit 1 ;; \\
+    esac \\
+    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/pnpm.tar.gz \\
+         "https://github.com/pnpm/pnpm/releases/download/v11.15.1/pnpm-linux-\${pnpm_arch}.tar.gz" \\
+    && echo "\${pnpm_sha}  /tmp/pnpm.tar.gz" | sha256sum -c - \\
+    && tar -xzf /tmp/pnpm.tar.gz -C /home/kortix/.local/bin \\
+    && rm /tmp/pnpm.tar.gz \\
+    && test "$(pnpm --version)" = "11.15.1" \\
+    && pnpm runtime set node 22.23.1 -g \\
+    && test "$(node --version)" = "v22.23.1" \\
+    && pnpm add -g "npm@12.0.1" \\
+    && test "$(npm --version)" = "12.0.1"
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \\
+    AGENT_BROWSER_EXECUTABLE_PATH=/home/kortix/.local/bin/chromium \\
+    AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage \\
+    PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=1800000
+RUN pnpm add -g --allow-build=agent-browser "agent-browser@0.27.0" \\
+    && agent-browser --version \\
+    && for pw_try in 1 2 3 4 5; do \\
+        pnpm dlx playwright@1.60.0 install --with-deps chromium && break; \\
+        echo "playwright chromium install attempt $pw_try failed, retrying..."; \\
+        sleep $((pw_try*10)); \\
+    done \\
+    && sudo rm -rf /var/lib/apt/lists/* \\
+    && pw_chrome="$(find /opt/pw-browsers -type f -path '*chrome-linux*/chrome' | head -n1)" \\
+    && test -n "$pw_chrome" \\
+    && ln -sf "$pw_chrome" /home/kortix/.local/bin/chromium \\
+    && mkdir -p /home/kortix/.agent-browser/browsers \\
+    && ln -sf "$(dirname "$pw_chrome")" /home/kortix/.agent-browser/browsers/chrome-linux64 \\
+    && chromium --version \\
+    && env -u AGENT_BROWSER_EXECUTABLE_PATH agent-browser doctor 2>&1 | grep -qE 'pass.+chrome-linux64/chrome'
+
+RUN pnpm add -g --allow-build=opencode-ai "opencode-ai@1.18.23" \\
+    && command -v opencode \\
+    && opencode --version \\
+    && opencode_native="$(sed -n 's/^# cmd-shim-target=//p' "$(command -v opencode)" | tail -n 1)" \\
+    && test -x "$opencode_native" \\
+    && test "$(wc -c < "$opencode_native")" -gt 50000000 \\
+    && test "$("$opencode_native" --version)" = "1.18.23" \\
+    && ln -sfn "$opencode_native" /opt/kortix/opencode.current \\
+    && sudo ln -sfn /opt/kortix/opencode.current /usr/local/bin/opencode-kortix \\
+    && test "$(/usr/local/bin/opencode-kortix --version)" = "1.18.23"
+
+COPY --chown=kortix:kortix kortix-opencode-warmup /tmp/kortix-opencode-warmup
+RUN bash /tmp/kortix-opencode-warmup migration && rm -f /tmp/kortix-opencode-warmup
+
+RUN case "$(uname -m)" in \\
+      x86_64) bun_arch=x64; bun_sha=3e730528d89775f03f87f05c06787c4df4099d0a37f3f252e7b829cb23816e18 ;; \\
+      aarch64|arm64) bun_arch=aarch64; bun_sha=efa9813da5ed72423bf847f916e8d2c47c0d776add972354026a75e10da9aa21 ;; \\
+      *) echo "unsupported Bun architecture: $(uname -m)" >&2; exit 1 ;; \\
+    esac \\
+    && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/bun.zip \\
+         "https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/bun-linux-\${bun_arch}.zip" \\
+    && echo "\${bun_sha}  /tmp/bun.zip" | sha256sum -c - \\
+    && unzip -q /tmp/bun.zip -d /tmp/bun \\
+    && install -m 0755 "/tmp/bun/bun-linux-\${bun_arch}/bun" /home/kortix/.bun/bin/bun \\
+    && ln -sf bun /home/kortix/.bun/bin/bunx \\
+    && rm -rf /tmp/bun /tmp/bun.zip \\
+    && test "$(bun --version)" = "1.4.3"
+
+RUN pnpm add -g "@firecrawl/anydoc@0.1.6" \\
+    && command -v anydoc \\
+    && test "$(anydoc --version)" = "0.1.6"
+
+RUN mkdir -p /opt/kortix/opencode-config-deps \\
+    && cd /opt/kortix/opencode-config-deps \\
+    && printf '{"name":"kortix-opencode-config","private":true,"dependencies":{"@mendable/firecrawl-js":"^4.25.1","@opencode-ai/plugin":"1.18.23","@tavily/core":"^0.7.3","bun-pty":"0.4.11","replicate":"^1.4.0","zod":"4.1.8"},"overrides":{"axios":"1.18.0","form-data":"4.0.6"}}' > package.json \\
+    && bun install
+
+RUN cd /opt/kortix/opencode-config-deps \\
+    && bun build node_modules/axios/lib/utils.js node_modules/form-data/lib/form_data.js --target=bun --outdir=/tmp/opencode-deps-bundle-check \\
+    && rm -rf /tmp/opencode-deps-bundle-check \\
+    && echo "opencode-config-deps: baked tree bundles cleanly"
+
+COPY --chown=kortix:kortix kortix-opencode-config/ /opt/kortix/warm-config/.kortix/opencode/
+RUN sudo chown -R kortix:kortix /opt/kortix/warm-config
+RUN cd /opt/kortix/warm-config/.kortix/opencode \\
+    && rm -rf node_modules \\
+    && ln -s /opt/kortix/opencode-config-deps/node_modules node_modules \\
+    && bun build plugins/*.ts --target=bun --outdir=/tmp/opencode-plugins-bundle-check \\
+    && rm -rf /tmp/opencode-plugins-bundle-check \\
+    && echo "opencode-config-deps: starter plugin files bundle cleanly"
+
+COPY --chown=kortix:kortix kortix-opencode-warmup /tmp/kortix-opencode-warmup
+RUN bash /tmp/kortix-opencode-warmup instance targeted && rm -f /tmp/kortix-opencode-warmup
+
+USER root
+COPY kortix-agent.gz /tmp/kortix-agent.gz
+COPY kortix.gz /tmp/kortix.gz
+COPY kortix-entrypoint /usr/local/bin/kortix-entrypoint
+COPY MACHINE.md /MACHINE.md
+COPY kortix-slack-cli/ /opt/kortix/apps/sandbox/slack-cli/
+COPY kortix-llm-catalog.json /opt/kortix/llm-catalog.json
+COPY scaffold.git /opt/kortix/scaffold.git
+RUN gunzip -c /tmp/kortix-agent.gz > /usr/local/bin/kortix-agent \\
+    && gunzip -c /tmp/kortix.gz > /usr/local/bin/kortix \\
+    && rm /tmp/kortix-agent.gz /tmp/kortix.gz \\
+    && bash -n /usr/local/bin/kortix-entrypoint \\
+    && chmod +x /usr/local/bin/kortix-agent /usr/local/bin/kortix /usr/local/bin/kortix-entrypoint \\
+        /opt/kortix/apps/sandbox/slack-cli/install-shims.sh \\
+    && bash /opt/kortix/apps/sandbox/slack-cli/install-shims.sh /opt/kortix/apps/sandbox/slack-cli \\
+    && kortix --version \\
+    && chown kortix:kortix /usr/local/bin \\
+    && mkdir -p /home/kortix/.config/opencode && chown kortix:kortix /home/kortix/.config /home/kortix/.config/opencode && echo '{"autoupdate":false}' > /home/kortix/.config/opencode/opencode.json && chown kortix:kortix /home/kortix/.config/opencode/opencode.json && chmod 0644 /home/kortix/.config/opencode/opencode.json \\
+    && chown -R kortix:kortix /opt/kortix /workspace /ephemeral
+
+COPY --chown=kortix:kortix managed-skills /opt/kortix/managed-skills
+RUN kortix-agent bake-runtime-assets-state \\
+    && chown kortix:kortix /opt/kortix/runtime-assets-state.json
+
+RUN { \\
+      echo '# Kortix sandbox shell hook. Written by the Kortix runtime layer. Do not edit.'; \\
+      echo '# Debian resets PATH in /etc/profile for login shells: restore the Kortix tool dirs.'; \\
+      echo 'kortix_path_prefix='; \\
+      echo 'for kortix_path_dir in /home/kortix/.local/bin /home/kortix/.local/share/pnpm/bin /home/kortix/.bun/bin; do'; \\
+      echo '  case ":\${PATH-}:" in'; \\
+      echo '    *":\${kortix_path_dir}:"*) ;;'; \\
+      echo '    *) kortix_path_prefix="\${kortix_path_prefix}\${kortix_path_dir}:" ;;'; \\
+      echo '  esac'; \\
+      echo 'done'; \\
+      echo 'if [ -n "\${PATH-}" ]; then PATH="\${kortix_path_prefix}\${PATH}"; else PATH="\${kortix_path_prefix%:}"; fi'; \\
+      echo 'export PATH'; \\
+      echo 'unset kortix_path_prefix kortix_path_dir'; \\
+      echo '# Live project secrets, written by the kortix-agent daemon on tmpfs.'; \\
+      echo 'if [ -r /dev/shm/kortix/agent-env.sh ]; then . /dev/shm/kortix/agent-env.sh; fi'; \\
+    } > /etc/profile.d/zz-kortix.sh \\
+    && chmod 0644 /etc/profile.d/zz-kortix.sh \\
+    && { grep -qxF 'if [ -r /etc/profile.d/zz-kortix.sh ]; then . /etc/profile.d/zz-kortix.sh; fi' /etc/bash.bashrc 2>/dev/null \\
+         || echo 'if [ -r /etc/profile.d/zz-kortix.sh ]; then . /etc/profile.d/zz-kortix.sh; fi' >> /etc/bash.bashrc; }
+
+ENV KORTIX_WORKSPACE=/workspace
+USER kortix
+WORKDIR /workspace
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/kortix-entrypoint"]
+"
+`;

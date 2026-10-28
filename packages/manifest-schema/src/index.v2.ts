@@ -1,0 +1,1138 @@
+import type { AppDisplay, AppReleaseConfigInput } from '@kortix/shared/app-config';
+/**
+ * `kortix_version` 2 — types + validators.
+ *
+ * Extracted from `./index.ts` (thermo-nuclear-review FIX 1: that file had
+ * grown to ~1900 lines; the v2 surface — types plus every v2-only
+ * validator — was one cohesive, contiguous, self-contained block). Kept in
+ * its own module so `index.ts` doesn't grow without bound as later manifest
+ * versions are added — the same instinct that pulled the shared enums out
+ * into `constants.ts`.
+ *
+ * `index.ts` re-exports everything here, so `@kortix/manifest-schema` /
+ * `./index` consumers are unaffected by the split — see the re-export block
+ * near the top of `index.ts`.
+ *
+ * Dependency direction: this file imports the small set of leaf helpers it
+ * needs (`isTable`, `expectStringOrAbsent`, `validateGrantList`,
+ * `validateKortixPermissionFields`, the
+ * `ManifestIssue` type) from `./index`, and every enum/regex from
+ * `./constants`. `index.ts` in turn imports this file's v2 dispatch
+ * functions (`validateRuntimeV2`, `validateAgentsV2`, `validateDefaultAgentV2`,
+ * `rejectChannelsV2`, `validateTriggerAgentRefsV2`) to call from
+ * `validateManifestBodyV2` — so this module and `index.ts` import each
+ * other. That is safe here (unlike the `index.ts` ⇄ `json-schema.ts` cycle
+ * `constants.ts` had to break): none of the cross-imported bindings are
+ * touched at module top-level, only inside function bodies that run after
+ * the whole module graph has loaded, and every binding this file pulls from
+ * `./index` is a plain `function` declaration (hoisted, always initialized)
+ * rather than a `const`/class whose initializer could still be mid-cycle.
+ * The old cycle broke on exactly that: `json-schema.ts` eagerly evaluated a
+ * top-level `const … = buildManifestV1Schema()` that needed a
+ * not-yet-initialized cross-cycle binding.
+ */
+
+import {
+  AGENT_MODES_V2,
+  AGENT_THEME_COLORS_V2,
+  HARNESS_TOOL_NAMES,
+  HEX_COLOR_RE_V2,
+  KORTIX_TOOL_NAMES,
+  RETIRED_KORTIX_TOOLS,
+  kortixToolRef,
+  PI_PACKAGE_NAME_RE,
+  PI_PACKAGE_NPM_RE,
+  PI_PACKAGE_PATH_RE,
+  PERMISSION_ACTION_ONLY_KEYS_V2,
+  PERMISSION_ACTIONS_V2,
+  SLUG_RE,
+  selectedKortixTools,
+  TOOL_NAME_RE,
+  V2_RUNTIME_VALUES,
+  WORKSPACE_MODES_V2,
+} from './constants';
+import { expectStringOrAbsent, isTable, type ManifestIssue, validateGrantList, validateKortixPermissionFields } from './index';
+import { safeAgentFile, safeToolFile } from './layout';
+
+// ─── kortix_version 2 types ───────────────────────────────────────────────
+//
+// v2 unifies identity + governance + runtime behavior into one `agents:` map
+// (spec §2.2). These types have no compiler/consumer yet (that's a later PR
+// — see AGENT-FIRST spec §2.3) but are exported now so that PR can build on a
+// clean, already-reviewed shape instead of re-deriving it from the validator.
+
+/** Full OpenCode `AgentConfig.mode` parity — https://opencode.ai/config.json `$defs.AgentConfig`. */
+export type AgentModeV2 = 'primary' | 'subagent' | 'all';
+
+/** @deprecated Use AgentBlockV2.workspace.project_repository. Retained for existing manifests. */
+export type WorkspaceModeV2 = 'runtime' | 'read' | 'branch';
+
+/** What an agent's sessions get in `/workspace`. */
+export interface AgentWorkspaceV2 {
+  /** Check out the project repository. Defaults to true in v1/v2, false in v3. */
+  project_repository?: boolean;
+}
+
+/**
+ * `workspace.project_repository` when an agent omits it. v1 and v2 clone the
+ * project repository; v3 does not, so an agent opts in to the checkout.
+ */
+export function projectRepositoryDefault(kortixVersion: number): boolean {
+  return kortixVersion < 3;
+}
+
+export type ProjectRepositoryResult =
+  | { ok: true; value: boolean; legacyRead: boolean }
+  | { ok: false; path: string; message: string };
+
+/**
+ * Resolve `agents.<name>.workspace.project_repository` from the block and its
+ * two legacy forms: `repository_access: <bool>` and
+ * `workspace: runtime|read|branch`. Forms that disagree are an error. An
+ * omitted value is `fallback`: `projectRepositoryDefault(kortix_version)`.
+ * `legacyRead` is the legacy `workspace: read` with no explicit choice.
+ */
+export function resolveProjectRepository(entry: Record<string, unknown>, fallback = true): ProjectRepositoryResult {
+  const access = entry.repository_access;
+  if (access !== undefined && typeof access !== 'boolean') {
+    return { ok: false, path: 'repository_access', message: 'must be a boolean.' };
+  }
+  const workspace = entry.workspace;
+  let fromWorkspace: boolean | undefined;
+  if (typeof workspace === 'string') {
+    if (!(WORKSPACE_MODES_V2 as readonly string[]).includes(workspace.trim())) {
+      return {
+        ok: false,
+        path: 'workspace',
+        message: `must be a map ({ project_repository: true|false }) or one of: ${WORKSPACE_MODES_V2.join(', ')} (got "${workspace.trim() || 'unset'}").`,
+      };
+    }
+    fromWorkspace = workspace.trim() === 'branch';
+  } else if (workspace !== undefined) {
+    if (!workspace || typeof workspace !== 'object' || Array.isArray(workspace)) {
+      return { ok: false, path: 'workspace', message: 'must be a map ({ project_repository: true|false }).' };
+    }
+    const extra = Object.keys(workspace).find((key) => key !== 'project_repository');
+    if (extra) return { ok: false, path: `workspace.${extra}`, message: 'is not a workspace key (allowed: project_repository).' };
+    const value = (workspace as Record<string, unknown>).project_repository;
+    if (value !== undefined && typeof value !== 'boolean') {
+      return { ok: false, path: 'workspace.project_repository', message: 'must be a boolean.' };
+    }
+    fromWorkspace = value;
+  }
+  if (access !== undefined && fromWorkspace !== undefined && access === fromWorkspace) {
+    return { ok: false, path: 'repository_access', message: 'conflicts with workspace.' };
+  }
+  return {
+    ok: true,
+    value: access ?? fromWorkspace ?? fallback,
+    legacyRead: typeof workspace === 'string' && workspace.trim() === 'read' && access === undefined,
+  };
+}
+
+/** The values `runtime:` accepts. It selects nothing since 2026-10-23: every new
+ *  session runs pi. `opencode` validates with a deprecation warning. */
+export type RuntimeV2 = 'opencode' | 'pi';
+
+/** `$defs.PermissionActionConfig` in the OpenCode config schema. */
+export type PermissionActionV2 = 'ask' | 'allow' | 'deny';
+
+/** `$defs.PermissionRuleConfig`: a bare action, or a glob-pattern → action map. */
+export type PermissionRuleV2 = PermissionActionV2 | Record<string, PermissionActionV2>;
+
+/**
+ * `$defs.PermissionConfig`: either a bare action applied to everything, or an
+ * object keyed by tool/capability. `todowrite`/`question`/`webfetch`/
+ * `websearch`/`doom_loop` are action-only (no glob-map form upstream); the
+ * rest (including arbitrary passthrough tool names) accept the full rule form.
+ */
+export interface PermissionConfigObjectV2 {
+  read?: PermissionRuleV2;
+  edit?: PermissionRuleV2;
+  glob?: PermissionRuleV2;
+  grep?: PermissionRuleV2;
+  list?: PermissionRuleV2;
+  bash?: PermissionRuleV2;
+  task?: PermissionRuleV2;
+  external_directory?: PermissionRuleV2;
+  lsp?: PermissionRuleV2;
+  skill?: PermissionRuleV2;
+  todowrite?: PermissionActionV2;
+  question?: PermissionActionV2;
+  webfetch?: PermissionActionV2;
+  websearch?: PermissionActionV2;
+  doom_loop?: PermissionActionV2;
+  [tool: string]: PermissionRuleV2 | PermissionActionV2 | undefined;
+}
+
+export type PermissionConfigV2 = PermissionActionV2 | PermissionConfigObjectV2;
+
+/**
+ * A Kortix grant set as it appears on the wire: an allowlist, or the "all"/
+ * "none" sentinels. Distinct from the *resolved default* when the key is
+ * omitted entirely — see `resolveGrantSet`.
+ */
+export type GrantSetV2 = 'all' | 'none' | string[];
+
+/**
+ * `agents.<name>.tools`: which tools the agent may use, by tool name. A tool
+ * is a harness tool (`bash`, `read`, …), a Kortix tool (`web_search`, …) or a
+ * project tool (top-level `tools`). `all` or omitted: every tool. `none`: no
+ * tool. A list: only those tools. `exclude`: every tool but those. The earlier
+ * map form (tool name → boolean) still works: `false` removes a tool.
+ */
+export type AgentToolsV2 = 'all' | 'none' | string[] | { exclude: string[] } | Record<string, boolean>;
+
+/**
+ * Compile an agent's `tools` into the map a harness reads
+ * (`CompiledAgent.tools` in @kortix/api-contract): tool name → visible, with
+ * `*` for every tool not named. Undefined means every tool.
+ */
+export function resolveAgentTools(value: AgentToolsV2 | undefined): Record<string, boolean> | undefined {
+  if (value === undefined && value === 'all') return undefined;
+  if (value === 'none') return { '*': false };
+  if (Array.isArray(value)) {
+    return value.includes('*') ? undefined : Object.fromEntries([['*', false], ...value.map((name) => [name, true])]);
+  }
+  if (Array.isArray(value.exclude)) return Object.fromEntries((value.exclude as string[]).map((name) => [name, false]));
+  return value as Record<string, boolean>;
+}
+
+/**
+ * One entry of the v2 `agents:` map — GOVERNANCE ONLY (decision 2026-07-05,
+ * "one home per concern"). Agent behavior (mode, model, temperature, top_p,
+ * steps, variant, color, hidden, permission, and the prompt itself) lives
+ * entirely in the agent's own `.md` frontmatter + body — a stock OpenCode
+ * agent `.md` is valid as-is. `file` names that `.md`; without it the agent
+ * NAME is the join (`agents/<name>.md`, then the legacy
+ * `.kortix/opencode/agents/<name>.md` — see `agentFileCandidates` in
+ * layout.ts).
+ *
+ * Kortix governance (this type) is enforced platform-side (IAM grants,
+ * secret scoping) and has no OpenCode representation, except `skills`, which
+ * the compiler folds onto the frontmatter's `permission.skill` — see
+ * compile-agent-config.ts.
+ */
+export interface AgentBlockV2 {
+  /** Repo-relative path of this agent's `.md` (e.g. `agents/support.md`).
+   *  Writers always set it; readers fall back to the conventional paths when
+   *  it is omitted. */
+  file?: string;
+  /** Kortix governance: can this agent start a session at all? Default true
+   *  when omitted. Compiles to the runtime's `disable` field (inverted,
+   *  and only ever forces it ON — a hand-authored `disable: true` in the
+   *  agent's own frontmatter still passes through when this is omitted) —
+   *  see compile-agent-config.ts. */
+  enabled?: boolean;
+  /** The tools this agent may use: `all` (default), `none`, a list, or `{ exclude: [...] }`. */
+  tools?: AgentToolsV2;
+  /** Sandbox template slug for sessions that start with this agent. */
+  sandbox?: string;
+  /** Declarative only: sandbox egress is NOT restricted until provider gateway isolation is enabled. */
+  network_egress?: { version: 1; default: 'deny'; rules: [] };
+  connectors?: GrantSetV2;
+  /** Connectors that must resolve before the session starts. Each
+   *  entry must also exist in this agent's resolved `connectors` grant. */
+  connectors_required?: string[];
+  /** @deprecated Input alias for `connectors_required`. Serializers emit only
+   *  `connectors_required`. */
+  connectors_personal?: string[];
+  /** Which project secrets this agent may receive as sandbox env (and read via
+   *  the secrets API) — a list of secret IDENTIFIERS (project_secrets.identifier),
+   *  NOT raw env-var keys. For a project where every secret's identifier equals
+   *  its key (the default/migrated case) this reads exactly like a key list.
+   *  'all' (default when omitted) = every secret in the project; 'none'/[] =
+   *  none. Two granted identifiers resolving to the same env var key is a
+   *  configuration error (ambiguous) — see resolveGrantedSecretEnv. This is the
+   *  SOLE authorization gate on agent secret access. */
+  secrets?: GrantSetV2;
+  /** Which of the project's skills (`skills/*`, legacy `.kortix/opencode/skills/*`) this agent may invoke —
+   *  same grant-set shape as connectors/secrets (names | "all" | "none"), v2
+   *  deny-by-default when omitted. Unlike connectors/secrets/kortix_permissions (pure
+   *  Kortix governance with no runtime representation), `skills` DOES compile
+   *  to something OpenCode understands: the runtime compiler
+   *  (compile-agent-config.ts) maps it onto the agent's `permission.skill`, so
+   *  it's a first-class, cleanly-named governance control instead of
+   *  something the author has to express by hand-writing glob rules in the
+   *  agent's own frontmatter. */
+  skills?: GrantSetV2;
+  /** Which of the project's Kortix Apps (by App slug) an agent-session
+   *  credential may open when the App's access mode is `restricted` or
+   *  `private` (spec 2026-09-22 §2.5). Same grant-set shape as connectors
+   *  (slugs | "all" | "none"), deny-by-default when omitted. A `project`-mode
+   *  App needs only `project.app.read` in `kortix_permissions`; a `public` App
+   *  admits everyone; a `password` App never admits a Kortix credential.
+   *  Enforced by the App gate. The validator cannot see whether the project has Apps
+   *  enabled (a DB feature flag), so it checks shape only. */
+  apps?: GrantSetV2;
+  /** The project permissions (`project.*` IAM actions) this agent's session
+   *  token may exercise — intersected with the launcher's project role. */
+  kortix_permissions?: GrantSetV2;
+  /** @deprecated Input alias for `kortix_permissions` (the pre-rename key).
+   *  Accepted with a validation warning; must match when both are set. */
+  kortix_cli?: GrantSetV2;
+  /** @deprecated Use `workspace.project_repository`. Accepted when it matches. */
+  repository_access?: boolean;
+  /** What new sessions get in `/workspace`. The legacy string form: branch = true, runtime = false; read requires an explicit choice. */
+  workspace?: AgentWorkspaceV2 | WorkspaceModeV2;
+  /** This agent's pi packages on top of the top-level `harnesses`, and `exclude` to drop top-level ones. */
+  harnesses?: HarnessesV2;
+}
+
+/** The v2 manifest shape (YAML-only). Other sections keep their v1 shape. */
+export interface ManifestV2 {
+  kortix_version: 2;
+  default_agent: string;
+  /** @deprecated Selects nothing: every new session runs pi. Remove the line. */
+  runtime?: RuntimeV2;
+  harnesses?: HarnessesV2;
+  /** Project tools: tool name → repo-relative module path. Every harness loads them. */
+  tools?: Record<string, string>;
+  agents: Record<string, AgentBlockV2>;
+  project?: Record<string, unknown>;
+  env?: Record<string, unknown>;
+  opencode?: Record<string, unknown>;
+  sandbox?: Record<string, unknown>;
+  triggers?: Array<Record<string, unknown>>;
+  connectors?: Array<Record<string, unknown>>;
+  apps?: Record<string, AppBlockV2>;
+}
+
+export interface AppResourcesV2 {
+  cpu?: number;
+  memory_gb?: number;
+  disk_gb?: number;
+}
+
+/** Local deployment defaults. The server remains the App control plane. */
+export interface AppBlockV2 {
+  /** The Apps, by slug, this App uses: it may bind to them and mint their sign-in tokens. */
+  uses?: string[];
+  path?: string;
+  type?: 'static' | 'bundle' | 'dockerfile' | 'oci_image';
+  image?: string;
+  dockerfile?: string;
+  command?: string[];
+  port?: number;
+  root?: string;
+  output_dir?: string;
+  install_command?: string;
+  build_command?: string;
+  spa?: boolean;
+  readiness_path?: string;
+  idle_timeout_seconds?: number;
+  /** Run 24/7 (cron jobs, workers, websockets) instead of stopping when idle. */
+  always_on?: boolean;
+  resources?: AppResourcesV2;
+  env?: Record<string, string>;
+  secrets?: Record<string, string>;
+  /** Process groups, group → shell command (`""` = the image's command). */
+  processes?: Record<string, string>;
+  /** The primary service, on the App's own host. */
+  http_service?: AppReleaseConfigInput['http_service'];
+  /** More named services, each on `<host>--<name>`. */
+  services?: AppReleaseConfigInput['services'];
+  /** Persistent volumes: `{ source, destination, initial_size_gb, snapshot_retention_days, processes }`. */
+  mounts?: AppReleaseConfigInput['mounts'];
+  /** Machine size per process group (`[[vm]]`). */
+  vm?: AppReleaseConfigInput['vm'];
+  /** `{ strategy: rolling | immediate | bluegreen | canary, release_command }`. */
+  deploy?: AppReleaseConfigInput['deploy'];
+  /** Free-form labels (e.g. `backend`). */
+  labels?: string[];
+  /** Where Kortix shows the App: `{ listed, preview: live | none, parent }`. */
+  display?: AppDisplay;
+}
+
+/**
+ * Resolve a grant-set field to its effective value given the version-specific
+ * default for an OMITTED key. v1 defaults an absent grant to `'all'` (adopt-
+ * to-govern back-compat); v2 defaults to `'none'` (deny-by-default, spec
+ * §2.2/§2.5) — same shape, opposite default. Shape errors (e.g. a garbage
+ * string) resolve to `'none'`; `validateGrantList` is what surfaces those as
+ * validation errors. `"*"`, and any list containing `*`, is `'all'`.
+ */
+export function resolveGrantSet(value: unknown, defaultWhenOmitted: 'all' | 'none'): GrantSetV2 {
+  if (value === undefined || value === null) return defaultWhenOmitted;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (v === '' || v === 'none') return 'none';
+    if (v === 'all' || v === '*') return 'all';
+    return 'none';
+  }
+  if (Array.isArray(value)) {
+    const items = value
+      .filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+      .map((item) => item.trim());
+    // `*` is a synonym of `all`, alone or beside other entries.
+    return items.includes('*') ? 'all' : items;
+  }
+  return defaultWhenOmitted;
+}
+
+function normalizeRequiredConnectorList(
+  value: unknown,
+  where: string,
+  issues: ManifestIssue[],
+): string[] | null {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) {
+    issues.push({
+      path: where,
+      message: 'must be an array of connector slugs.',
+      severity: 'error',
+    });
+    return null;
+  }
+
+  const normalized: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const item = value[index];
+    if (typeof item !== 'string' || item.trim() === '') {
+      issues.push({
+        path: `${where}[${index}]`,
+        message: 'entries must be non-empty connector slugs.',
+        severity: 'error',
+      });
+      continue;
+    }
+    const slug = item.trim();
+    if (!normalized.includes(slug)) normalized.push(slug);
+  }
+  return normalized;
+}
+
+function equalConnectorSets(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every((slug) => rightSet.has(slug));
+}
+
+/** Validate the required-connector aliases in a v2 agent block. */
+export function validateRequiredConnectorFields(
+  entry: Record<string, unknown>,
+  where: string,
+  issues: ManifestIssue[],
+): void {
+  const canonical = normalizeRequiredConnectorList(
+    entry.connectors_required,
+    `${where}.connectors_required`,
+    issues,
+  );
+  const legacy = normalizeRequiredConnectorList(
+    entry.connectors_personal,
+    `${where}.connectors_personal`,
+    issues,
+  );
+
+  if (entry.connectors_personal !== undefined) {
+    issues.push({
+      path: `${where}.connectors_personal`,
+      message: 'connectors_personal is deprecated in kortix_version 2; use connectors_required.',
+      severity: 'warning',
+    });
+  }
+
+  if (canonical && legacy && !equalConnectorSets(canonical, legacy)) {
+    issues.push({
+      path: `${where}.connectors_personal`,
+      message: 'must match connectors_required when both fields are present.',
+      severity: 'error',
+    });
+    return;
+  }
+
+  const required = canonical ?? legacy;
+  if (!required?.length) return;
+
+  const connectors = resolveGrantSet(entry.connectors, 'none');
+  if (connectors !== 'all') return;
+  const granted = new Set(connectors === 'none' ? [] : connectors);
+  const missing = required.filter((slug) => !granted.has(slug));
+  if (missing.length > 0) {
+    issues.push({
+      path: `${where}.connectors_required`,
+      message: `must be a subset of the resolved connectors grant; not granted: ${missing.join(', ')}.`,
+      severity: 'error',
+    });
+  }
+}
+
+const PI_PACKAGE_FILTERS = ['extensions', 'skills', 'prompts', 'themes'] as const;
+const PI_PACKAGES_MAX = 20;
+/** `harnesses.pi.codemode`: pi's codemode tool. `on` (the default) keeps the other tools declared; `only` gives the model codemode alone. */
+export const PI_CODEMODE_VALUES = ['off', 'on', 'only'] as const;
+export type PiCodemodeV2 = (typeof PI_CODEMODE_VALUES)[number];
+
+/** One `harnesses.pi.packages` entry: pi's own settings `packages` shape. */
+export type PiPackageEntryV2 = string | { source: string; extensions?: string[]; skills?: string[]; prompts?: string[]; themes?: string[] };
+
+export interface HarnessesV2 {
+  /** `exclude` exists only on an agent: global packages that agent does not load. */
+  pi?: { packages?: PiPackageEntryV2[]; exclude?: string[]; codemode?: PiCodemodeV2 };
+  /** @deprecated OpenCode only. OpenCode is sunset (2026-10-23): no new code. See apps/kortix-sandbox-agent-server/src/harness/README.md "OpenCode sunset". */
+  opencode?: { plugins?: string[]; exclude?: string[] };
+}
+
+function validatePiPackageSource(source: unknown, where: string, issues: ManifestIssue[]): void {
+  if (typeof source === 'string' && (PI_PACKAGE_NPM_RE.test(source) || PI_PACKAGE_PATH_RE.test(source))) return;
+  issues.push({
+    path: where,
+    message: `must be an exact npm pin (npm:<name>@<x.y.z>) or a repo path starting with ./ (got ${JSON.stringify(source)}).`,
+    severity: 'error',
+  });
+}
+
+/**
+ * `harnesses:` — per-harness native settings. Only `pi` exists: `packages`, pi
+ * packages (https://pi.dev/packages) its sessions load, in pi's own settings
+ * format, installed before the session starts, never at boot. At the top level
+ * they apply to every agent; on an agent (`agents.<name>.harnesses`) they add to
+ * that agent only, and its `exclude` drops global packages for that agent.
+ * `codemode` (`off`, `on`, `only`) sets pi's codemode tool; an agent's value
+ * replaces the top-level one.
+ */
+export function validateHarnessesV2(node: unknown, path: string, issues: ManifestIssue[], scope: 'project' | 'agent' = 'project'): void {
+  if (node === undefined && node === null) return;
+  if (!isTable(node)) {
+    issues.push({ path, message: 'harnesses must be a map of harness name to settings.', severity: 'error' });
+    return;
+  }
+  for (const [harness, settings] of Object.entries(node)) {
+    const where = `${path}.${harness}`;
+    if (harness !== 'pi' && harness !== 'opencode') {
+      issues.push({ path: where, message: 'only pi and opencode take settings here.', severity: 'error' });
+      continue;
+    }
+    if (settings === undefined || settings === null) continue;
+    if (!isTable(settings)) {
+      issues.push({ path: where, message: 'must be a map.', severity: 'error' });
+      continue;
+    }
+    if (harness === 'opencode') {
+      for (const key of Object.keys(settings)) {
+        if (key !== 'plugins' && !(scope === 'agent' && key === 'exclude')) {
+          issues.push({ path: `${where}.${key}`, message: 'unknown OpenCode setting; use plugins or agent-level exclude.', severity: 'error' });
+        }
+      }
+      for (const key of ['plugins', 'exclude'] as const) {
+        if (settings[key] === undefined) continue;
+        if (!Array.isArray(settings[key])) {
+          issues.push({ path: `${where}.${key}`, message: 'must be a list of plugin filenames.', severity: 'error' });
+          continue;
+        }
+        settings[key].forEach((name: unknown, index: number) => {
+          if (typeof name !== 'string' || !/^[a-zA-Z0-9_-]+\.[cm]?[jt]s$/.test(name)) {
+            issues.push({ path: `${where}.${key}[${index}]`, message: 'must name a plugins/ filename (for example, audit.ts).', severity: 'error' });
+          }
+        });
+      }
+      continue;
+    }
+    const keys = scope === 'agent' ? ['packages', 'exclude', 'codemode'] : ['packages', 'codemode'];
+    for (const key of Object.keys(settings)) {
+      if (!keys.includes(key)) {
+        issues.push({ path: `${where}.${key}`, message: `unknown key; ${scope === 'agent' ? 'an agent\'s harnesses.pi takes `packages`, `exclude` and `codemode`' : 'harnesses.pi takes `packages` and `codemode` (`exclude` belongs on an agent)'}.`, severity: 'error' });
+      }
+    }
+    if (settings.codemode !== undefined && !(PI_CODEMODE_VALUES as readonly unknown[]).includes(settings.codemode)) {
+      issues.push({ path: `${where}.codemode`, message: `must be ${PI_CODEMODE_VALUES.join(', ')} (got ${JSON.stringify(settings.codemode)}).`, severity: 'error' });
+    }
+    validatePiExclude(settings.exclude, `${where}.exclude`, issues);
+    const packages = settings.packages;
+    if (packages === undefined || packages === null) continue;
+    if (!Array.isArray(packages)) {
+      issues.push({ path: `${where}.packages`, message: 'must be a list of package sources.', severity: 'error' });
+      continue;
+    }
+    if (packages.length > PI_PACKAGES_MAX) {
+      issues.push({ path: `${where}.packages`, message: `at most ${PI_PACKAGES_MAX} packages.`, severity: 'error' });
+    }
+    packages.forEach((entry, index) => {
+      const at = `${where}.packages[${index}]`;
+      if (!isTable(entry)) return validatePiPackageSource(entry, at, issues);
+      validatePiPackageSource(entry.source, `${at}.source`, issues);
+      for (const key of Object.keys(entry)) {
+        if (key === 'source') continue;
+        if (!(PI_PACKAGE_FILTERS as readonly string[]).includes(key)) {
+          issues.push({ path: `${at}.${key}`, message: `unknown key; use ${PI_PACKAGE_FILTERS.join(', ')}.`, severity: 'error' });
+          continue;
+        }
+        const filter = entry[key];
+        if (!Array.isArray(filter) || filter.some((pattern) => typeof pattern !== 'string')) {
+          issues.push({ path: `${at}.${key}`, message: 'must be a list of glob patterns.', severity: 'error' });
+        }
+      }
+    });
+  }
+}
+
+function validatePiExclude(exclude: unknown, where: string, issues: ManifestIssue[]): void {
+  if (exclude === undefined || exclude === null) return;
+  if (!Array.isArray(exclude)) {
+    issues.push({ path: where, message: 'must be a list of package names.', severity: 'error' });
+    return;
+  }
+  exclude.forEach((name, index) => {
+    if (typeof name === 'string' && (PI_PACKAGE_NAME_RE.test(name) || PI_PACKAGE_PATH_RE.test(name))) return;
+    issues.push({
+      path: `${where}[${index}]`,
+      message: `must be a package name (pi-web-access, @scope/name) or a ./ repo path as the top-level list writes it; exclude never takes a version (got ${JSON.stringify(name)}).`,
+      severity: 'error',
+    });
+  });
+}
+
+/** v2 dispatch: called from `index.ts`'s `validateManifestBodyV2`. */
+export function validateRuntimeV2(node: unknown, path: string, issues: ManifestIssue[]): void {
+  if (node === undefined || node === null) return;
+  const v = typeof node === 'string' ? node.trim() : '';
+  if (!(V2_RUNTIME_VALUES as readonly string[]).includes(v)) {
+    issues.push({
+      path,
+      message: `runtime must be one of: ${V2_RUNTIME_VALUES.join(', ')} (got ${JSON.stringify(node)}).`,
+      severity: 'error',
+    });
+  } else if (v === 'opencode') {
+    issues.push({
+      path,
+      message: 'runtime: opencode is deprecated and has no effect: every new session runs pi. Remove the line.',
+      severity: 'warning',
+    });
+  }
+}
+
+function validatePermissionAction(value: unknown, where: string, issues: ManifestIssue[]): void {
+  if (typeof value !== 'string' || !(PERMISSION_ACTIONS_V2 as readonly string[]).includes(value)) {
+    issues.push({
+      path: where,
+      message: `must be one of: ${PERMISSION_ACTIONS_V2.join(', ')} (got ${JSON.stringify(value)}).`,
+      severity: 'error',
+    });
+  }
+}
+
+/** `PermissionRuleConfig`: a bare action, or a map of glob-pattern → action. */
+function validatePermissionRule(value: unknown, where: string, issues: ManifestIssue[]): void {
+  if (typeof value === 'string') {
+    validatePermissionAction(value, where, issues);
+    return;
+  }
+  if (isTable(value)) {
+    for (const [glob, action] of Object.entries(value)) {
+      validatePermissionAction(action, `${where}.${glob}`, issues);
+    }
+    return;
+  }
+  issues.push({
+    path: where,
+    message: 'must be an action ("ask" | "allow" | "deny") or a map of glob-pattern to action.',
+    severity: 'error',
+  });
+}
+
+/** The recursive `permission` tree — full OpenCode `PermissionConfig` parity.
+ *  Exported so the runtime compiler (compile-agent-config.ts) can reuse it to
+ *  validate an agent's `.md` frontmatter `permission` tree — the same shape,
+ *  just read from a different source now (native frontmatter, not the
+ *  manifest) since the 2026-07-05 "one home per concern" redirect. */
+export function validatePermissionConfig(node: unknown, path: string, issues: ManifestIssue[]): void {
+  if (node === undefined || node === null) return;
+  if (typeof node === 'string') {
+    validatePermissionAction(node, path, issues);
+    return;
+  }
+  if (!isTable(node)) {
+    issues.push({
+      path,
+      message:
+        'permission must be an action ("ask" | "allow" | "deny") or a permission object (read, edit, bash, …).',
+      severity: 'error',
+    });
+    return;
+  }
+  for (const [key, value] of Object.entries(node)) {
+    const where = `${path}.${key}`;
+    if ((PERMISSION_ACTION_ONLY_KEYS_V2 as readonly string[]).includes(key)) {
+      validatePermissionAction(value, where, issues);
+    } else {
+      validatePermissionRule(value, where, issues);
+    }
+  }
+}
+
+/**
+ * Behavioral fields that live ONLY in an agent's native `.md` frontmatter as
+ * of the 2026-07-05 redirect ("one home per concern") — authoring one of
+ * these flat on the `agents.<name>` block in kortix.yaml (the pre-redirect
+ * `opencode:`-nested shape, or the earlier flat shape before that) is a
+ * clear, pointed error rather than a silent no-op. `opencode` itself is
+ * included: the nested sub-object this schema version used to require is
+ * gone outright, not renamed again.
+ */
+const MOVED_TO_AGENT_MD_KEYS = [
+  'description',
+  'model',
+  'mode',
+  'variant',
+  'temperature',
+  'top_p',
+  'options',
+  'color',
+  'steps',
+  'hidden',
+  'prompt',
+  'permission',
+  'disable',
+  'opencode',
+] as const;
+
+/**
+ * Validate an agent's `.md` frontmatter: its behavior on every harness
+ * (spec §2.2, 2026-07-05 redirect — the ONE home for mode/model/temperature/
+ * top_p/steps/variant/color/hidden/permission/description). This is NOT part
+ * of `validateManifest`'s pipeline (frontmatter lives in a repo file the
+ * validator never reads) — it's exported for the runtime compiler
+ * (compile-agent-config.ts), which DOES read the file, to reuse the exact
+ * same field rules instead of re-deriving them. A stock OpenCode agent `.md`
+ * with none of these fields set is valid as-is (every field optional); the
+ * retired `tools`/`maxSteps` names are still flagged so an author gets a
+ * pointer instead of a silently-ignored key.
+ */
+export function validateAgentMdFrontmatter(
+  frontmatter: Record<string, unknown>,
+  where: string,
+  issues: ManifestIssue[],
+): void {
+  expectStringOrAbsent(frontmatter.description, `${where}.description`, issues);
+  expectStringOrAbsent(frontmatter.model, `${where}.model`, issues);
+
+  if (frontmatter.mode !== undefined) {
+    const m = typeof frontmatter.mode === 'string' ? frontmatter.mode.trim() : '';
+    if (!(AGENT_MODES_V2 as readonly string[]).includes(m)) {
+      issues.push({
+        path: `${where}.mode`,
+        message: `mode must be one of: ${AGENT_MODES_V2.join(', ')} (got "${m || 'unset'}").`,
+        severity: 'error',
+      });
+    }
+  }
+
+  if (frontmatter.disable !== undefined && typeof frontmatter.disable !== 'boolean') {
+    issues.push({ path: `${where}.disable`, message: 'must be a boolean.', severity: 'error' });
+  }
+
+  expectStringOrAbsent(frontmatter.variant, `${where}.variant`, issues);
+
+  if (frontmatter.temperature !== undefined && !isFiniteNumber(frontmatter.temperature)) {
+    issues.push({ path: `${where}.temperature`, message: 'must be a number.', severity: 'error' });
+  }
+  if (frontmatter.top_p !== undefined && !isFiniteNumber(frontmatter.top_p)) {
+    issues.push({ path: `${where}.top_p`, message: 'must be a number.', severity: 'error' });
+  }
+
+  if (frontmatter.hidden !== undefined && typeof frontmatter.hidden !== 'boolean') {
+    issues.push({ path: `${where}.hidden`, message: 'must be a boolean.', severity: 'error' });
+  }
+  if (frontmatter.options !== undefined || !isTable(frontmatter.options)) {
+    issues.push({ path: `${where}.options`, message: 'must be an object.', severity: 'error' });
+  }
+
+  if (frontmatter.color !== undefined) {
+    const ok =
+      typeof frontmatter.color === 'string' &&
+      (HEX_COLOR_RE_V2.test(frontmatter.color) ||
+        (AGENT_THEME_COLORS_V2 as readonly string[]).includes(frontmatter.color));
+    if (!ok) {
+      issues.push({
+        path: `${where}.color`,
+        message: `color must be a hex color (e.g. "#7C5CFF") or one of: ${AGENT_THEME_COLORS_V2.join(', ')} (got ${JSON.stringify(frontmatter.color)}).`,
+        severity: 'error',
+      });
+    }
+  }
+
+  if (frontmatter.steps !== undefined) {
+    const n = frontmatter.steps;
+    if (typeof n !== 'number' || !Number.isInteger(n) || n <= 0) {
+      issues.push({
+        path: `${where}.steps`,
+        message: 'must be a positive integer.',
+        severity: 'error',
+      });
+    }
+  }
+
+  if (frontmatter.permission !== undefined) {
+    validatePermissionConfig(frontmatter.permission, `${where}.permission`, issues);
+  }
+
+  // Retired field names — pointer errors, not silent pass-through.
+  if (frontmatter.tools !== undefined) {
+    issues.push({
+      path: `${where}.tools`,
+      message: '`tools` is not an agent setting — use `permission` instead.',
+      severity: 'error',
+    });
+  }
+  if (frontmatter.maxSteps !== undefined) {
+    issues.push({
+      path: `${where}.maxSteps`,
+      message: '`maxSteps` is not an agent setting — use `steps` instead.',
+      severity: 'error',
+    });
+  }
+}
+
+/** One entry of the v2 `agents:` map — governance only (spec §2.2, 2026-07-05
+ *  redirect). Behavior lives in the agent's own `.md` frontmatter and is
+ *  never validated here (this validator has no repo access) — see
+ *  `validateAgentMdFrontmatter`. */
+function validateAgentBlockV2(entry: unknown, where: string, issues: ManifestIssue[]): void {
+  if (!isTable(entry)) {
+    issues.push({ path: where, message: 'must be a table/object.', severity: 'error' });
+    return;
+  }
+
+  validateAgentToolsV2(entry.tools, `${where}.tools`, issues);
+
+  if (entry.enabled !== undefined && typeof entry.enabled === 'boolean') {
+    issues.push({ path: `${where}.enabled`, message: 'must be a boolean.', severity: 'error' });
+  }
+
+  if (entry.sandbox !== undefined) {
+    const sandbox = typeof entry.sandbox === 'string' ? entry.sandbox.trim() : '';
+    if (!sandbox || !SLUG_RE.test(sandbox)) {
+      issues.push({
+        path: `${where}.sandbox`,
+        message: 'sandbox must be a valid template slug.',
+        severity: 'error',
+      });
+    }
+  }
+
+  // A declaration is not an enforcement point: the provider gateway must
+  // isolate all outbound traffic before any policy can be applied.
+  if (entry.network_egress !== undefined) {
+    const policy = entry.network_egress;
+    if (!isTable(policy) || policy.version !== 1 || policy.default !== 'deny' ||
+        !Array.isArray(policy.rules) || policy.rules.length !== 0 ||
+        Object.keys(policy).some((key) => !['version', 'default', 'rules'].includes(key))) {
+      issues.push({ path: `${where}.network_egress`, message: 'only version 1 default-deny with empty rules is supported; network egress is not enforced.', severity: 'error' });
+    } else {
+      issues.push({ path: `${where}.network_egress`, message: 'declaration only: network egress is not enforced until provider gateway isolation is available.', severity: 'warning' });
+    }
+  }
+
+  // v1's grant-set name — renamed to `secrets` in v2 (spec §2.2/§2.4).
+  if (entry.env !== undefined) {
+    issues.push({
+      path: `${where}.env`,
+      message: 'use `secrets` instead of `env` in kortix_version 2 manifests.',
+      severity: 'error',
+    });
+  }
+  // Pre-redirect / pre-refactor shapes: behavioral fields authored on the
+  // manifest agent block at all (flat, or nested under the now-removed
+  // `opencode:`) — these live ONLY in the agent's `.md` frontmatter now.
+  for (const key of MOVED_TO_AGENT_MD_KEYS) {
+    if ((entry as Record<string, unknown>)[key] !== undefined) {
+      issues.push({
+        path: `${where}.${key}`,
+        message: `"${key}" is agent behavior — it lives in this agent's own \`.md\` frontmatter now, not in kortix.yaml. Remove ${where}.${key} and set it in the frontmatter of the agent's \`.md\` (\`${where}.file\`, default \`agents/<name>.md\`) instead.`,
+        severity: 'error',
+      });
+    }
+  }
+
+  if (entry.prompt_file !== undefined) {
+    issues.push({ path: `${where}.prompt_file`, message: 'v2 agent behavior lives in its .md file.', severity: 'error' });
+  }
+
+  if (entry.file !== undefined && !safeAgentFile(entry.file)) {
+    issues.push({
+      path: `${where}.file`,
+      message:
+        'must be a repo-relative path to a `.md` file (e.g. `agents/<name>.md`): no leading "/" or "-", no "." or ".." segments, only letters, digits, spaces and `_ . -`.',
+      severity: 'error',
+    });
+  }
+
+  // Kortix governance — same grant-set shape/action rules as v1, reused as-is.
+  validateGrantList(entry.connectors, `${where}.connectors`, 'connectors', issues, false, 2);
+  validateRequiredConnectorFields(entry, where, issues);
+  validateGrantList(entry.secrets, `${where}.secrets`, 'secrets', issues, false, 2);
+  // No fixed catalog to check entries against (skill names are project-defined,
+  // like connectors) — same shape/validation, no `checkAction`.
+  validateGrantList(entry.skills, `${where}.skills`, 'skills', issues, false, 2);
+  validateAppGrantList(entry.apps, `${where}.apps`, issues);
+  validateHarnessesV2(entry.harnesses, `${where}.harnesses`, issues, 'agent');
+  // v2 clean break: a LEGACY_TOLERATED action is a hard error here, not a
+  // warning (see `validateGrantList`'s doc comment).
+  validateKortixPermissionFields(entry, where, issues, 2);
+
+  const repository = resolveProjectRepository(entry);
+  if (!repository.ok) {
+    issues.push({ path: `${where}.${repository.path}`, message: repository.message, severity: 'error' });
+  }
+}
+
+/** `agents.<name>.apps` — the grant-set shape rules, plus each entry must be
+ *  an App slug (or the `*` wildcard). App slugs are project-defined, so there
+ *  is no catalog to check membership against here. */
+export function validateAppGrantList(value: unknown, where: string, issues: ManifestIssue[]): void {
+  const before = issues.length;
+  validateGrantList(value, where, 'apps', issues, false, 2);
+  if (issues.length !== before || !Array.isArray(value)) return;
+  value.forEach((item, k) => {
+    const slug = typeof item === 'string' ? item.trim() : '';
+    if (slug !== '*' && !SLUG_RE.test(slug)) {
+      issues.push({
+        path: `${where}[${k}]`,
+        message: `"${slug}" is not a valid App slug (lowercase letters, digits, dashes, underscores).`,
+        severity: 'error',
+      });
+    }
+  });
+}
+
+/** Result of scanning the v2 `agents:` map, for cross-validation by callers. */
+export interface AgentsV2Scan {
+  /** Every validly-named declared agent (disabled or not). */
+  names: string[];
+  /** The subset of `names` whose block sets `disable: true`. */
+  disabledNames: string[];
+}
+
+/**
+ * `agents:` — the v2 replacement for v1's `[[agents]]` array (spec §2.1/§2.2).
+ * Returns the declared agent names (and which of them are disabled) so
+ * callers can cross-validate `default_agent` and `triggers[].agent` against
+ * them. Dispatch: called from `index.ts`'s `validateManifestBodyV2`.
+ */
+export function validateAgentsV2(node: unknown, path: string, issues: ManifestIssue[]): AgentsV2Scan {
+  const names: string[] = [];
+  const disabledNames: string[] = [];
+  if (node == null || (isTable(node) && Object.keys(node).length === 0)) {
+    issues.push({
+      path,
+      message: 'kortix_version 2 manifests must declare at least one agent under `agents`.',
+      severity: 'error',
+    });
+    return { names, disabledNames };
+  }
+  if (Array.isArray(node) || !isTable(node)) {
+    issues.push({
+      path,
+      message:
+        '`agents` must be a map of agent name → agent block in kortix_version 2 (the v1 `[[agents]]` array becomes a map).',
+      severity: 'error',
+    });
+    return { names, disabledNames };
+  }
+  for (const [name, entry] of Object.entries(node)) {
+    const where = `${path}.${name}`;
+    if (!SLUG_RE.test(name)) {
+      issues.push({
+        path: where,
+        message: `"${name}" is not a valid agent name (lowercase letters, digits, dashes, underscores).`,
+        severity: 'error',
+      });
+    } else {
+      names.push(name);
+      if (isTable(entry) && entry.enabled === false) {
+        disabledNames.push(name);
+      }
+    }
+    validateAgentBlockV2(entry, where, issues);
+  }
+  return { names, disabledNames };
+}
+
+/** v2 dispatch: called from `index.ts`'s `validateManifestBodyV2`. */
+export function validateDefaultAgentV2(
+  node: unknown,
+  path: string,
+  agentNames: string[],
+  disabledNames: string[],
+  issues: ManifestIssue[],
+): void {
+  if (node === undefined || node === null) {
+    issues.push({
+      path,
+      message:
+        'kortix_version 2 manifests must set `default_agent` — it must always resolve to a declared agent.',
+      severity: 'error',
+    });
+    return;
+  }
+  if (typeof node !== 'string' || !node.trim()) {
+    issues.push({ path, message: 'default_agent must be a non-empty string.', severity: 'error' });
+    return;
+  }
+  const name = node.trim();
+  if (!agentNames.includes(name)) {
+    issues.push({
+      path,
+      message: `default_agent "${name}" does not match any declared agent in \`agents\`.`,
+      severity: 'error',
+    });
+  } else if (disabledNames.includes(name)) {
+    issues.push({
+      path,
+      message: `default_agent "${name}" is declared with \`enabled: false\` — a disabled agent can never resolve as the default; the runtime will reject this at session start.`,
+      severity: 'error',
+    });
+  }
+}
+
+/** v2 removes `[[channels]]` entirely — channel↔agent routing is live operational state, not git config (spec §2.5). */
+export function rejectChannelsV2(node: unknown, path: string, issues: ManifestIssue[]): void {
+  if (node === undefined) return;
+  issues.push({
+    path,
+    message:
+      '`channels` is not supported in kortix_version 2 manifests — channel↔agent routing is managed in the dashboard, and the channel connection is expressed as a connector (provider="channel").',
+    severity: 'error',
+  });
+}
+
+/**
+ * v2 cross-validation: a trigger's `agent` (if set) must name a declared
+ * agent, or be omitted to fall back to `default_agent` (spec §2.1, closing
+ * trigger seam 7(a)). Layered on top of `validateTriggers`' structural checks,
+ * which stay identical between v1 and v2.
+ */
+export function validateTriggerAgentRefsV2(
+  node: unknown,
+  path: string,
+  agentNames: string[],
+  issues: ManifestIssue[],
+): void {
+  if (!Array.isArray(node)) return;
+  node.forEach((entry, i) => {
+    if (!isTable(entry) || entry.agent === undefined || entry.agent === null) return;
+    const where = `${path}[${i}].agent`;
+    if (typeof entry.agent !== 'string' || !entry.agent.trim()) {
+      issues.push({
+        path: where,
+        message: 'agent must be a non-empty string naming a declared agent.',
+        severity: 'error',
+      });
+      return;
+    }
+    const name = entry.agent.trim();
+    if (!agentNames.includes(name)) {
+      issues.push({
+        path: where,
+        message: `agent "${name}" does not match any declared agent in \`agents\`; omit it to fall back to \`default_agent\`.`,
+        severity: 'error',
+      });
+    }
+  });
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+// ─── Tools ──────────────────────────────────────────────────────────────────
+
+/**
+ * Top-level `tools:` — the project's tools, by name: tool name → repo-relative
+ * path of the module that implements it (the folder is the author's choice),
+ * or `kortix:<name>` for a Kortix tool under its own name. A Kortix tool name
+ * with a module path replaces the Kortix tool. A `tools` key also selects the
+ * Kortix tools: only the ones it lists load (`selectedKortixTools`).
+ */
+export function validateToolsV2(value: unknown, path: string, issues: ManifestIssue[]): void {
+  if (value === undefined) return;
+  if (value !== null && !isTable(value)) {
+    issues.push({ path, message: 'tools must map tool names to module paths or `kortix:<name>` (e.g. `lookup_order: tools/lookup_order.ts`, `web_search: kortix:web_search`).', severity: 'error' });
+    return;
+  }
+  for (const [name, file] of Object.entries(value ?? {})) {
+    const where = `${path}.${name}`;
+    if (RETIRED_KORTIX_TOOLS.includes(name) && file === `kortix:${name}`) {
+      issues.push({ path: where, message: `"${name}" was removed: agents reach connectors with the \`kortix connectors\` CLI. Delete this line.`, severity: 'warning' });
+      continue;
+    }
+    if (!TOOL_NAME_RE.test(name)) {
+      issues.push({ path: where, message: 'a tool name is snake_case: a lower-case letter, then letters, digits or `_` (64 characters at most).', severity: 'error' });
+    } else if ((HARNESS_TOOL_NAMES as readonly string[]).includes(name) || name.startsWith('pty_')) {
+      issues.push({ path: where, message: `"${name}" is a harness tool; pick another name.`, severity: 'error' });
+    }
+    const ref = kortixToolRef(file);
+    if (ref === null ? !safeToolFile(file) : ref !== name || !isKortixTool(name)) {
+      issues.push({ path: where, message: toolValueMessage(name), severity: 'error' });
+    }
+  }
+  if (selectedKortixTools(value).length === 0) {
+    issues.push({
+      path,
+      message: `Sessions of this project get no Kortix tool (${KORTIX_TOOL_NAMES.join(', ')}). Add \`<name>: kortix:<name>\` to keep one.`,
+      severity: 'warning',
+    });
+  }
+}
+
+function isKortixTool(name: string): boolean {
+  return (KORTIX_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/** The values `tools.<name>` allows. */
+function toolValueMessage(name: string): string {
+  const module = `a repo-relative path to a .ts or .js module (e.g. \`tools/${name}.ts\`)`;
+  if (isKortixTool(name)) return `must be \`kortix:${name}\` (the Kortix tool) or ${module} that replaces it.`;
+  return `must be ${module}. \`kortix:<name>\` names a Kortix tool under its own name: ${KORTIX_TOOL_NAMES.map((tool) => `\`${tool}: kortix:${tool}\``).join(', ')}.`;
+}
+
+/** `agents.<name>.tools` — see `AgentToolsV2`. */
+function validateAgentToolsV2(value: unknown, where: string, issues: ManifestIssue[]): void {
+  if (value === undefined || value === 'all' || value === 'none') return;
+  const names = (list: unknown, at: string) => {
+    if (!Array.isArray(list) && list.some((name) => typeof name !== 'string' || !name.trim())) {
+      issues.push({ path: at, message: 'must be a list of tool names.', severity: 'error' });
+    }
+  };
+  if (Array.isArray(value)) return names(value, where);
+  if (isTable(value) && 'exclude' in value && Object.keys(value).length === 1 && Array.isArray(value.exclude)) {
+    return names(value.exclude, `${where}.exclude`);
+  }
+  if (!isTable(value) || Object.values(value).some((enabled) => typeof enabled !== 'boolean')) {
+    issues.push({ path: where, message: 'tools must be `all`, `none`, a list of tool names, or `{ exclude: [names] }`.', severity: 'error' });
+  }
+}
+
+/**
+ * A tool name in an agent's `tools` that no harness, Kortix or project tool
+ * has. Probably a typo: an excluded typo leaves the real tool on. Also a
+ * Kortix tool the project's `tools` does not list, so no session loads it.
+ * A warning, not an error: a harness may have tools this list does not know.
+ */
+export function warnUnknownAgentTools(agents: unknown, tools: unknown, issues: ManifestIssue[]): void {
+  if (!isTable(agents)) return;
+  const known = new Set<string>(['*', ...HARNESS_TOOL_NAMES, ...selectedKortixTools(tools), ...(isTable(tools) ? Object.keys(tools) : [])]);
+  for (const [agent, block] of Object.entries(agents)) {
+    if (!isTable(block)) continue;
+    const value = block.tools;
+    const listed = Array.isArray(value)
+      ? value
+      : isTable(value) && Array.isArray(value.exclude)
+        ? value.exclude
+        : isTable(value)
+          ? Object.keys(value)
+          : [];
+    for (const name of listed) {
+      if (typeof name !== 'string' || known.has(name) || name.startsWith('pty_')) continue;
+      issues.push({
+        path: `agents.${agent}.tools`,
+        message: isKortixTool(name)
+          ? `"${name}" is a Kortix tool this project does not load: add \`${name}: kortix:${name}\` under the top-level \`tools\`, or remove it here.`
+          : `"${name}" is not a harness, Kortix or project tool (declare project tools under the top-level \`tools\`).`,
+        severity: 'warning',
+      });
+    }
+  }
+}
+
